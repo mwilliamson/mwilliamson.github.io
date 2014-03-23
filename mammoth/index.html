@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>mwilliamson.github.io</title>
+    <link rel="stylesheet" type="text/css" href="../style.css" />
+  </head>
+  <body>
+    <div class="container">
+      <h1><a href="../">mwilliamson's projects</a></h1>
+      
+      <h2>Mammoth</h2>
+      
+      <p>
+        Mammoth converts .docx documents, such as those created by Microsoft Word, to HTML.
+        Mammoth aims to produce simple and clean HTML by using semantic information in the document,
+        and ignoring other details.
+        For instance, Mammoth converts any paragraph with the style <code>Heading1</code> to <code>h1</code> elements,
+        rather than attempting to exactly copy the styling (font, text size, colour, etc.) of the heading.
+        If you've defined your own styles in your document,
+        then Mammoth allows you to map those styles to appropriate HTML.
+      </p>
+
+      <p>
+        There's a large mismatch between the structure used by .docx and the structure of HTML,
+        meaning that the conversion is unlikely to be perfect for more complicated documents.
+        Mammoth works best if you only use styles to semantically mark up your document.
+      </p>
+      
+      <p>
+        Development of Mammoth is ongoing,
+        so support for features is added as necessary.
+        Contributions are welcome!
+      </p>
+      
+      <p>
+        There's both a <a href="https://github.com/mwilliamson/mammoth.js">JavaScript implementation</a> (browser and node.js) and a <a href="https://github.com/mwilliamson/python-mammoth">Python implementation</a>.
+        The README of each project contains details on installation and usage.
+      </p>
+      
+      <h3>Demo</h3>
+      
+      <p>
+        Try it out by uploading a .docx file.
+        This will run Mammoth using the default style mappings,
+        so it will only expect standard Word styles such as <code>Heading1</code>.
+      </p>
+      
+      <p>
+        Don't have a document handy?
+        Try <a href="http://www.microsoft.com/en-gb/download/confirmation.aspx?id=26552">this example from Microsoft</a>.
+      </p>
+      
+      <div class="demo">
+        <p>
+          Select a .docx file: <input id="document" type="file" />
+        </p>
+        
+        <h4>Output</h4>
+        
+        <div id="output">
+        </div>
+        
+        <h4>Messages</h4>
+        
+        <div id="messages">
+        </div>
+      </div>
+    </div>
+    
+    <script src="mammoth.browser.min.js"></script>
+    <script src="demo.js"></script>
+  </body>
+</html>

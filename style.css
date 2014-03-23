@@ -1,0 +1,19 @@
+html {
+    font-family: helvetica, arial, sans-serif;
+    line-height: 1.5;
+}
+
+body {
+    margin: 0;
+    padding: 0;
+}
+
+.container {
+    margin: 0 auto;
+    max-width: 600px;
+}
+
+h1 a {
+    text-decoration: none;
+    color: #003399;
+}
