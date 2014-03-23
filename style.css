@@ -1,6 +1,6 @@
 html {
     font-family: helvetica, arial, sans-serif;
-    line-height: 1.5;
+    line-height: 1.7;
 }
 
 body {
@@ -16,4 +16,21 @@ body {
 h1 a {
     text-decoration: none;
     color: #003399;
+}
+
+.demo {
+    margin: 0 -20px;
+    padding: 5px 20px;
+    background-color: #e1e3e5;
+}
+
+.demo #output {
+    background-color: #fff;
+    min-height: 200px;
+    margin: 0 -10px;
+    padding: 5px 10px;
+}
+
+.demo #output img {
+    max-width: 100%;
 }
