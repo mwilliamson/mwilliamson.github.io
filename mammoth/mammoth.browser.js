@@ -1,4542 +1,498 @@
-/**
-
-JSZip - A Javascript class for generating and reading zip files
-<http://stuartk.com/jszip>
-
-(c) 2009-2012 Stuart Knightley <stuart [at] stuartk.com>
-Dual licenced under the MIT license or GPLv3. See LICENSE.markdown.
-
-Usage:
-   zip = new JSZip();
-   zip.file("hello.txt", "Hello, World!").add("tempfile", "nothing");
-   zip.folder("images").file("smile.gif", base64Data, {base64: true});
-   zip.file("Xmas.txt", "Ho ho ho !", {date : new Date("December 25, 2007 00:00:01")});
-   zip.remove("tempfile");
-
-   base64zip = zip.generate();
-
-**/
-
-/**
- * Representation a of zip file in js
- * @constructor
- * @param {String=|ArrayBuffer=|Uint8Array=} data the data to load, if any (optional).
- * @param {Object=} options the options for creating this objects (optional).
- */
-var JSZip = function(data, options) {
-   // object containing the files :
-   // {
-   //   "folder/" : {...},
-   //   "folder/data.txt" : {...}
-   // }
-   this.files = {};
-
-   // Where we are in the hierarchy
-   this.root = "";
-
-   if (data) {
-      this.load(data, options);
-   }
-};
-
-JSZip.signature = {
-   LOCAL_FILE_HEADER : "\x50\x4b\x03\x04",
-   CENTRAL_FILE_HEADER : "\x50\x4b\x01\x02",
-   CENTRAL_DIRECTORY_END : "\x50\x4b\x05\x06",
-   ZIP64_CENTRAL_DIRECTORY_LOCATOR : "\x50\x4b\x06\x07",
-   ZIP64_CENTRAL_DIRECTORY_END : "\x50\x4b\x06\x06",
-   DATA_DESCRIPTOR : "\x50\x4b\x07\x08"
-};
-
-// Default properties for a new file
-JSZip.defaults = {
-   base64: false,
-   binary: false,
-   dir: false,
-   date: null
-};
-
-
-JSZip.prototype = (function () {
-   /**
-    * A simple object representing a file in the zip file.
-    * @constructor
-    * @param {string} name the name of the file
-    * @param {string} data the data
-    * @param {Object} options the options of the file
-    */
-   var ZipObject = function (name, data, options) {
-      this.name = name;
-      this.data = data;
-      this.options = options;
-   };
-
-   ZipObject.prototype = {
-      /**
-       * Return the content as UTF8 string.
-       * @return {string} the UTF8 string.
-       */
-      asText : function () {
-         var result = this.data;
-         if (result === null || typeof result === "undefined") {
-            return "";
-         }
-         if (this.options.base64) {
-            result = JSZipBase64.decode(result);
-         }
-         if (this.options.binary) {
-            result = JSZip.prototype.utf8decode(result);
-         }
-         return result;
-      },
-      /**
-       * Returns the binary content.
-       * @return {string} the content as binary.
-       */
-      asBinary : function () {
-         var result = this.data;
-         if (result === null || typeof result === "undefined") {
-            return "";
-         }
-         if (this.options.base64) {
-            result = JSZipBase64.decode(result);
-         }
-         if (!this.options.binary) {
-            result = JSZip.prototype.utf8encode(result);
-         }
-         return result;
-      },
-      /**
-       * Returns the content as an Uint8Array.
-       * @return {Uint8Array} the content as an Uint8Array.
-       */
-      asUint8Array : function () {
-         return JSZip.utils.string2Uint8Array(this.asBinary());
-      },
-      /**
-       * Returns the content as an ArrayBuffer.
-       * @return {ArrayBuffer} the content as an ArrayBufer.
-       */
-      asArrayBuffer : function () {
-         return JSZip.utils.string2Uint8Array(this.asBinary()).buffer;
-      }
-   };
-
-   /**
-    * Transform an integer into a string in hexadecimal.
-    * @private
-    * @param {number} dec the number to convert.
-    * @param {number} bytes the number of bytes to generate.
-    * @returns {string} the result.
-    */
-   var decToHex = function(dec, bytes) {
-      var hex = "", i;
-      for(i = 0; i < bytes; i++) {
-         hex += String.fromCharCode(dec&0xff);
-         dec=dec>>>8;
-      }
-      return hex;
-   };
-
-   /**
-    * Merge the objects passed as parameters into a new one.
-    * @private
-    * @param {...Object} var_args All objects to merge.
-    * @return {Object} a new object with the data of the others.
-    */
-   var extend = function () {
-      var result = {}, i, attr;
-      for (i = 0; i < arguments.length; i++) { // arguments is not enumerable in some browsers
-         for (attr in arguments[i]) {
-            if (arguments[i].hasOwnProperty(attr) && typeof result[attr] === "undefined") {
-               result[attr] = arguments[i][attr];
-            }
-         }
-      }
-      return result;
-   };
-
-   /**
-    * Transforms the (incomplete) options from the user into the complete
-    * set of options to create a file.
-    * @private
-    * @param {Object} o the options from the user.
-    * @return {Object} the complete set of options.
-    */
-   var prepareFileAttrs = function (o) {
-      o = o || {};
-      if (o.base64 === true && o.binary == null) {
-         o.binary = true;
-      }
-      o = extend(o, JSZip.defaults);
-      o.date = o.date || new Date();
-
-      return o;
-   };
-
-  /**
-   * Add a file in the current folder.
-   * @private
-   * @param {string} name the name of the file
-   * @param {String|ArrayBuffer|Uint8Array} data the data of the file
-   * @param {Object} o the options of the file
-   * @return {Object} the new file.
-   */
-   var fileAdd = function (name, data, o) {
-      // be sure sub folders exist
-      var parent = parentFolder(name);
-      if (parent) {
-         folderAdd.call(this, parent);
-      }
-
-      o = prepareFileAttrs(o);
-
-      if (o.dir || data === null || typeof data === "undefined") {
-         o.base64 = false;
-         o.binary = false;
-         data = null;
-      } else if (JSZip.support.uint8array && data instanceof Uint8Array) {
-         o.base64 = false;
-         o.binary = true;
-         data = JSZip.utils.uint8Array2String(data);
-      } else if (JSZip.support.arraybuffer && data instanceof ArrayBuffer) {
-         o.base64 = false;
-         o.binary = true;
-         var bufferView = new Uint8Array(data);
-         data = JSZip.utils.uint8Array2String(bufferView);
-      } else if (o.binary && !o.base64) {
-         // optimizedBinaryString == true means that the file has already been filtered with a 0xFF mask
-         if (o.optimizedBinaryString !== true) {
-            // this is a string, not in a base64 format.
-            // Be sure that this is a correct "binary string"
-            data = JSZip.utils.string2binary(data);
-         }
-         // we remove this option since it's only relevant here
-         delete o.optimizedBinaryString;
-      }
-
-      return this.files[name] = new ZipObject(name, data, o);
-   };
-
-
-   /**
-    * Find the parent folder of the path.
-    * @private
-    * @param {string} path the path to use
-    * @return {string} the parent folder, or ""
-    */
-   var parentFolder = function (path) {
-      if (path.slice(-1) == '/') {
-         path = path.substring(0, path.length - 1);
-      }
-      var lastSlash = path.lastIndexOf('/');
-      return (lastSlash > 0) ? path.substring(0, lastSlash) : "";
-   };
-
-   /**
-    * Add a (sub) folder in the current folder.
-    * @private
-    * @param {string} name the folder's name
-    * @return {Object} the new folder.
-    */
-   var folderAdd = function (name) {
-      // Check the name ends with a /
-      if (name.slice(-1) != "/") {
-         name += "/"; // IE doesn't like substr(-1)
-      }
-
-      // Does this folder already exist?
-      if (!this.files[name]) {
-         // be sure sub folders exist
-         var parent = parentFolder(name);
-         if (parent) {
-            folderAdd.call(this, parent);
-         }
-
-         fileAdd.call(this, name, null, {dir:true});
-      }
-      return this.files[name];
-   };
-
-   /**
-    * Generate the data found in the local header of a zip file.
-    * Do not create it now, as some parts are re-used later.
-    * @private
-    * @param {Object} file the file to use.
-    * @param {string} utfEncodedFileName the file name, utf8 encoded.
-    * @param {string} compressionType the compression to use.
-    * @return {Object} an object containing header and compressedData.
-    */
-   var prepareLocalHeaderData = function(file, utfEncodedFileName, compressionType) {
-      var useUTF8 = utfEncodedFileName !== file.name,
-          data    = file.asBinary(),
-          o       = file.options,
-          dosTime,
-          dosDate;
-
-      // date
-      // @see http://www.delorie.com/djgpp/doc/rbinter/it/52/13.html
-      // @see http://www.delorie.com/djgpp/doc/rbinter/it/65/16.html
-      // @see http://www.delorie.com/djgpp/doc/rbinter/it/66/16.html
-
-      dosTime = o.date.getHours();
-      dosTime = dosTime << 6;
-      dosTime = dosTime | o.date.getMinutes();
-      dosTime = dosTime << 5;
-      dosTime = dosTime | o.date.getSeconds() / 2;
-
-      dosDate = o.date.getFullYear() - 1980;
-      dosDate = dosDate << 4;
-      dosDate = dosDate | (o.date.getMonth() + 1);
-      dosDate = dosDate << 5;
-      dosDate = dosDate | o.date.getDate();
-
-      var hasData = data !== null && data.length !== 0;
-
-      var compression    = JSZip.compressions[compressionType];
-      var compressedData = hasData ? compression.compress(data) : '';
-
-      var header = "";
-
-      // version needed to extract
-      header += "\x0A\x00";
-      // general purpose bit flag
-      // set bit 11 if utf8
-      header += useUTF8 ? "\x00\x08" : "\x00\x00";
-      // compression method
-      header += hasData ? compression.magic : JSZip.compressions['STORE'].magic;
-      // last mod file time
-      header += decToHex(dosTime, 2);
-      // last mod file date
-      header += decToHex(dosDate, 2);
-      // crc-32
-      header += hasData ? decToHex(this.crc32(data), 4) : '\x00\x00\x00\x00';
-      // compressed size
-      header += hasData ? decToHex(compressedData.length, 4) : '\x00\x00\x00\x00';
-      // uncompressed size
-      header += hasData ? decToHex(data.length, 4) : '\x00\x00\x00\x00';
-      // file name length
-      header += decToHex(utfEncodedFileName.length, 2);
-      // extra field length
-      header += "\x00\x00";
-
-      return {
-         header:header,
-         compressedData:compressedData
-      };
-   };
-
-
-   // return the actual prototype of JSZip
-   return {
-      /**
-       * Read an existing zip and merge the data in the current JSZip object.
-       * The implementation is in jszip-load.js, don't forget to include it.
-       * @param {String|ArrayBuffer|Uint8Array} stream  The stream to load
-       * @param {Object} options Options for loading the stream.
-       *  options.base64 : is the stream in base64 ? default : false
-       * @return {JSZip} the current JSZip object
-       */
-      load : function (stream, options) {
-         throw new Error("Load method is not defined. Is the file jszip-load.js included ?");
-      },
-
-      /**
-       * Filter nested files/folders with the specified function.
-       * @param {Function} search the predicate to use :
-       * function (relativePath, file) {...}
-       * It takes 2 arguments : the relative path and the file.
-       * @return {Array} An array of matching elements.
-       */
-      filter : function (search) {
-         var result = [], filename, relativePath, file, fileClone;
-         for (filename in this.files) {
-            if ( !this.files.hasOwnProperty(filename) ) { continue; }
-            file = this.files[filename];
-            // return a new object, don't let the user mess with our internal objects :)
-            fileClone = new ZipObject(file.name, file.data, extend(file.options));
-            relativePath = filename.slice(this.root.length, filename.length);
-            if (filename.slice(0, this.root.length) === this.root && // the file is in the current root
-                search(relativePath, fileClone)) { // and the file matches the function
-               result.push(fileClone);
-            }
-         }
-         return result;
-      },
-
-      /**
-       * Add a file to the zip file, or search a file.
-       * @param   {string|RegExp} name The name of the file to add (if data is defined),
-       * the name of the file to find (if no data) or a regex to match files.
-       * @param   {String|ArrayBuffer|Uint8Array} data  The file data, either raw or base64 encoded
-       * @param   {Object} o     File options
-       * @return  {JSZip|Object|Array} this JSZip object (when adding a file),
-       * a file (when searching by string) or an array of files (when searching by regex).
-       */
-      file : function(name, data, o) {
-         if (arguments.length === 1) {
-            if (name instanceof RegExp) {
-               var regexp = name;
-               return this.filter(function(relativePath, file) {
-                  return !file.options.dir && regexp.test(relativePath);
-               });
-            } else { // text
-               return this.filter(function (relativePath, file) {
-                  return !file.options.dir && relativePath === name;
-               })[0]||null;
-            }
-         } else { // more than one argument : we have data !
-            name = this.root+name;
-            fileAdd.call(this, name, data, o);
-         }
-         return this;
-      },
-
-      /**
-       * Add a directory to the zip file, or search.
-       * @param   {String|RegExp} arg The name of the directory to add, or a regex to search folders.
-       * @return  {JSZip} an object with the new directory as the root, or an array containing matching folders.
-       */
-      folder : function(arg) {
-         if (!arg) {
-            return this;
-         }
-
-         if (arg instanceof RegExp) {
-            return this.filter(function(relativePath, file) {
-               return file.options.dir && arg.test(relativePath);
-            });
-         }
-
-         // else, name is a new folder
-         var name = this.root + arg;
-         var newFolder = folderAdd.call(this, name);
-
-         // Allow chaining by returning a new object with this folder as the root
-         var ret = this.clone();
-         ret.root = newFolder.name;
-         return ret;
-      },
-
-      /**
-       * Delete a file, or a directory and all sub-files, from the zip
-       * @param {string} name the name of the file to delete
-       * @return {JSZip} this JSZip object
-       */
-      remove : function(name) {
-         name = this.root + name;
-         var file = this.files[name];
-         if (!file) {
-            // Look for any folders
-            if (name.slice(-1) != "/") {
-               name += "/";
-            }
-            file = this.files[name];
-         }
-
-         if (file) {
-            if (!file.options.dir) {
-               // file
-               delete this.files[name];
-            } else {
-               // folder
-               var kids = this.filter(function (relativePath, file) {
-                  return file.name.slice(0, name.length) === name;
-               });
-               for (var i = 0; i < kids.length; i++) {
-                  delete this.files[kids[i].name];
-               }
-            }
-         }
-
-         return this;
-      },
-
-      /**
-       * Generate the complete zip file
-       * @param {Object} options the options to generate the zip file :
-       * - base64, (deprecated, use type instead) true to generate base64.
-       * - compression, "STORE" by default.
-       * - type, "base64" by default. Values are : string, base64, uint8array, arraybuffer, blob.
-       * @return {String|Uint8Array|ArrayBuffer|Blob} the zip file
-       */
-      generate : function(options) {
-         options = extend(options || {}, {
-            base64 : true,
-            compression : "STORE",
-            type : "base64"
-         });
-         var compression = options.compression.toUpperCase();
-
-         // The central directory, and files data
-         var directory = [], files = [], fileOffset = 0;
-
-         if (!JSZip.compressions[compression]) {
-            throw compression + " is not a valid compression method !";
-         }
-
-         for (var name in this.files) {
-            if ( !this.files.hasOwnProperty(name) ) { continue; }
-
-            var file = this.files[name];
-
-            var utfEncodedFileName = this.utf8encode(file.name);
-
-            var fileRecord = "",
-            dirRecord = "",
-            data = prepareLocalHeaderData.call(this, file, utfEncodedFileName, compression);
-            fileRecord = JSZip.signature.LOCAL_FILE_HEADER + data.header + utfEncodedFileName + data.compressedData;
-
-            dirRecord = JSZip.signature.CENTRAL_FILE_HEADER +
-            // version made by (00: DOS)
-            "\x14\x00" +
-            // file header (common to file and central directory)
-            data.header +
-            // file comment length
-            "\x00\x00" +
-            // disk number start
-            "\x00\x00" +
-            // internal file attributes TODO
-            "\x00\x00" +
-            // external file attributes
-            (this.files[name].options.dir===true?"\x10\x00\x00\x00":"\x00\x00\x00\x00")+
-            // relative offset of local header
-            decToHex(fileOffset, 4) +
-            // file name
-            utfEncodedFileName;
-
-            fileOffset += fileRecord.length;
-
-            files.push(fileRecord);
-            directory.push(dirRecord);
-         }
-
-         var fileData = files.join("");
-         var dirData = directory.join("");
-
-         var dirEnd = "";
-
-         // end of central dir signature
-         dirEnd = JSZip.signature.CENTRAL_DIRECTORY_END +
-         // number of this disk
-         "\x00\x00" +
-         // number of the disk with the start of the central directory
-         "\x00\x00" +
-         // total number of entries in the central directory on this disk
-         decToHex(files.length, 2) +
-         // total number of entries in the central directory
-         decToHex(files.length, 2) +
-         // size of the central directory   4 bytes
-         decToHex(dirData.length, 4) +
-         // offset of start of central directory with respect to the starting disk number
-         decToHex(fileData.length, 4) +
-         // .ZIP file comment length
-         "\x00\x00";
-
-         var zip = fileData + dirData + dirEnd;
-
-
-         switch(options.type.toLowerCase()) {
-            case "uint8array" :
-               return JSZip.utils.string2Uint8Array(zip);
-            case "arraybuffer" :
-               return JSZip.utils.string2Uint8Array(zip).buffer;
-            case "blob" :
-               return JSZip.utils.string2Blob(zip);
-            case "base64" :
-               return (options.base64) ? JSZipBase64.encode(zip) : zip;
-            default : // case "string" :
-               return zip;
-         }
-      },
-
-      /**
-       *
-       *  Javascript crc32
-       *  http://www.webtoolkit.info/
-       *
-       */
-      crc32 : function(str, crc) {
-
-         if (str === "" || typeof str === "undefined") {
-            return 0;
-         }
-
-         var table = [
-            0x00000000, 0x77073096, 0xEE0E612C, 0x990951BA,
-            0x076DC419, 0x706AF48F, 0xE963A535, 0x9E6495A3,
-            0x0EDB8832, 0x79DCB8A4, 0xE0D5E91E, 0x97D2D988,
-            0x09B64C2B, 0x7EB17CBD, 0xE7B82D07, 0x90BF1D91,
-            0x1DB71064, 0x6AB020F2, 0xF3B97148, 0x84BE41DE,
-            0x1ADAD47D, 0x6DDDE4EB, 0xF4D4B551, 0x83D385C7,
-            0x136C9856, 0x646BA8C0, 0xFD62F97A, 0x8A65C9EC,
-            0x14015C4F, 0x63066CD9, 0xFA0F3D63, 0x8D080DF5,
-            0x3B6E20C8, 0x4C69105E, 0xD56041E4, 0xA2677172,
-            0x3C03E4D1, 0x4B04D447, 0xD20D85FD, 0xA50AB56B,
-            0x35B5A8FA, 0x42B2986C, 0xDBBBC9D6, 0xACBCF940,
-            0x32D86CE3, 0x45DF5C75, 0xDCD60DCF, 0xABD13D59,
-            0x26D930AC, 0x51DE003A, 0xC8D75180, 0xBFD06116,
-            0x21B4F4B5, 0x56B3C423, 0xCFBA9599, 0xB8BDA50F,
-            0x2802B89E, 0x5F058808, 0xC60CD9B2, 0xB10BE924,
-            0x2F6F7C87, 0x58684C11, 0xC1611DAB, 0xB6662D3D,
-            0x76DC4190, 0x01DB7106, 0x98D220BC, 0xEFD5102A,
-            0x71B18589, 0x06B6B51F, 0x9FBFE4A5, 0xE8B8D433,
-            0x7807C9A2, 0x0F00F934, 0x9609A88E, 0xE10E9818,
-            0x7F6A0DBB, 0x086D3D2D, 0x91646C97, 0xE6635C01,
-            0x6B6B51F4, 0x1C6C6162, 0x856530D8, 0xF262004E,
-            0x6C0695ED, 0x1B01A57B, 0x8208F4C1, 0xF50FC457,
-            0x65B0D9C6, 0x12B7E950, 0x8BBEB8EA, 0xFCB9887C,
-            0x62DD1DDF, 0x15DA2D49, 0x8CD37CF3, 0xFBD44C65,
-            0x4DB26158, 0x3AB551CE, 0xA3BC0074, 0xD4BB30E2,
-            0x4ADFA541, 0x3DD895D7, 0xA4D1C46D, 0xD3D6F4FB,
-            0x4369E96A, 0x346ED9FC, 0xAD678846, 0xDA60B8D0,
-            0x44042D73, 0x33031DE5, 0xAA0A4C5F, 0xDD0D7CC9,
-            0x5005713C, 0x270241AA, 0xBE0B1010, 0xC90C2086,
-            0x5768B525, 0x206F85B3, 0xB966D409, 0xCE61E49F,
-            0x5EDEF90E, 0x29D9C998, 0xB0D09822, 0xC7D7A8B4,
-            0x59B33D17, 0x2EB40D81, 0xB7BD5C3B, 0xC0BA6CAD,
-            0xEDB88320, 0x9ABFB3B6, 0x03B6E20C, 0x74B1D29A,
-            0xEAD54739, 0x9DD277AF, 0x04DB2615, 0x73DC1683,
-            0xE3630B12, 0x94643B84, 0x0D6D6A3E, 0x7A6A5AA8,
-            0xE40ECF0B, 0x9309FF9D, 0x0A00AE27, 0x7D079EB1,
-            0xF00F9344, 0x8708A3D2, 0x1E01F268, 0x6906C2FE,
-            0xF762575D, 0x806567CB, 0x196C3671, 0x6E6B06E7,
-            0xFED41B76, 0x89D32BE0, 0x10DA7A5A, 0x67DD4ACC,
-            0xF9B9DF6F, 0x8EBEEFF9, 0x17B7BE43, 0x60B08ED5,
-            0xD6D6A3E8, 0xA1D1937E, 0x38D8C2C4, 0x4FDFF252,
-            0xD1BB67F1, 0xA6BC5767, 0x3FB506DD, 0x48B2364B,
-            0xD80D2BDA, 0xAF0A1B4C, 0x36034AF6, 0x41047A60,
-            0xDF60EFC3, 0xA867DF55, 0x316E8EEF, 0x4669BE79,
-            0xCB61B38C, 0xBC66831A, 0x256FD2A0, 0x5268E236,
-            0xCC0C7795, 0xBB0B4703, 0x220216B9, 0x5505262F,
-            0xC5BA3BBE, 0xB2BD0B28, 0x2BB45A92, 0x5CB36A04,
-            0xC2D7FFA7, 0xB5D0CF31, 0x2CD99E8B, 0x5BDEAE1D,
-            0x9B64C2B0, 0xEC63F226, 0x756AA39C, 0x026D930A,
-            0x9C0906A9, 0xEB0E363F, 0x72076785, 0x05005713,
-            0x95BF4A82, 0xE2B87A14, 0x7BB12BAE, 0x0CB61B38,
-            0x92D28E9B, 0xE5D5BE0D, 0x7CDCEFB7, 0x0BDBDF21,
-            0x86D3D2D4, 0xF1D4E242, 0x68DDB3F8, 0x1FDA836E,
-            0x81BE16CD, 0xF6B9265B, 0x6FB077E1, 0x18B74777,
-            0x88085AE6, 0xFF0F6A70, 0x66063BCA, 0x11010B5C,
-            0x8F659EFF, 0xF862AE69, 0x616BFFD3, 0x166CCF45,
-            0xA00AE278, 0xD70DD2EE, 0x4E048354, 0x3903B3C2,
-            0xA7672661, 0xD06016F7, 0x4969474D, 0x3E6E77DB,
-            0xAED16A4A, 0xD9D65ADC, 0x40DF0B66, 0x37D83BF0,
-            0xA9BCAE53, 0xDEBB9EC5, 0x47B2CF7F, 0x30B5FFE9,
-            0xBDBDF21C, 0xCABAC28A, 0x53B39330, 0x24B4A3A6,
-            0xBAD03605, 0xCDD70693, 0x54DE5729, 0x23D967BF,
-            0xB3667A2E, 0xC4614AB8, 0x5D681B02, 0x2A6F2B94,
-            0xB40BBE37, 0xC30C8EA1, 0x5A05DF1B, 0x2D02EF8D
-         ];
-
-         if (typeof(crc) == "undefined") { crc = 0; }
-         var x = 0;
-         var y = 0;
-
-         crc = crc ^ (-1);
-         for( var i = 0, iTop = str.length; i < iTop; i++ ) {
-            y = ( crc ^ str.charCodeAt( i ) ) & 0xFF;
-            x = table[y];
-            crc = ( crc >>> 8 ) ^ x;
-         }
-
-         return crc ^ (-1);
-      },
-
-      // Inspired by http://my.opera.com/GreyWyvern/blog/show.dml/1725165
-      clone : function() {
-         var newObj = new JSZip();
-         for (var i in this) {
-            if (typeof this[i] !== "function") {
-               newObj[i] = this[i];
-            }
-         }
-         return newObj;
-      },
-
-
-      /**
-       * http://www.webtoolkit.info/javascript-utf8.html
-       */
-      utf8encode : function (string) {
-         string = string.replace(/\r\n/g,"\n");
-         var utftext = "";
-
-         for (var n = 0; n < string.length; n++) {
-
-            var c = string.charCodeAt(n);
-
-            if (c < 128) {
-               utftext += String.fromCharCode(c);
-            } else if ((c > 127) && (c < 2048)) {
-               utftext += String.fromCharCode((c >> 6) | 192);
-               utftext += String.fromCharCode((c & 63) | 128);
-            } else {
-               utftext += String.fromCharCode((c >> 12) | 224);
-               utftext += String.fromCharCode(((c >> 6) & 63) | 128);
-               utftext += String.fromCharCode((c & 63) | 128);
-            }
-
-         }
-
-         return utftext;
-      },
-
-      /**
-       * http://www.webtoolkit.info/javascript-utf8.html
-       */
-      utf8decode : function (utftext) {
-         var string = "";
-         var i = 0;
-         var c = 0, c1 = 0, c2 = 0, c3 = 0;
-
-         while ( i < utftext.length ) {
-
-            c = utftext.charCodeAt(i);
-
-            if (c < 128) {
-               string += String.fromCharCode(c);
-               i++;
-            } else if ((c > 191) && (c < 224)) {
-               c2 = utftext.charCodeAt(i+1);
-               string += String.fromCharCode(((c & 31) << 6) | (c2 & 63));
-               i += 2;
-            } else {
-               c2 = utftext.charCodeAt(i+1);
-               c3 = utftext.charCodeAt(i+2);
-               string += String.fromCharCode(((c & 15) << 12) | ((c2 & 63) << 6) | (c3 & 63));
-               i += 3;
-            }
-
-         }
-
-         return string;
-      }
-   };
-}());
-
-/*
- * Compression methods
- * This object is filled in as follow :
- * name : {
- *    magic // the 2 bytes indentifying the compression method
- *    compress // function, take the uncompressed content and return it compressed.
- *    uncompress // function, take the compressed content and return it uncompressed.
- * }
- *
- * STORE is the default compression method, so it's included in this file.
- * Other methods should go to separated files : the user wants modularity.
- */
-JSZip.compressions = {
-   "STORE" : {
-      magic : "\x00\x00",
-      compress : function (content) {
-         return content; // no compression
-      },
-      uncompress : function (content) {
-         return content; // no compression
-      }
-   }
-};
-
-/*
- * List features that require a modern browser, and if the current browser support them.
- */
-JSZip.support = {
-   // contains true if JSZip can read/generate ArrayBuffer, false otherwise.
-   arraybuffer : (function(){
-      return typeof ArrayBuffer !== "undefined" && typeof Uint8Array !== "undefined";
-   })(),
-   // contains true if JSZip can read/generate Uint8Array, false otherwise.
-   uint8array : (function(){
-      return typeof Uint8Array !== "undefined";
-   })(),
-   // contains true if JSZip can read/generate Blob, false otherwise.
-   blob : (function(){
-      // the spec started with BlobBuilder then replaced it with a construtor for Blob.
-      // Result : we have browsers that :
-      // * know the BlobBuilder (but with prefix)
-      // * know the Blob constructor
-      // * know about Blob but not about how to build them
-      // About the "=== 0" test : if given the wrong type, it may be converted to a string.
-      // Instead of an empty content, we will get "[object Uint8Array]" for example.
-      if (typeof ArrayBuffer === "undefined") {
-         return false;
-      }
-      var buffer = new ArrayBuffer(0);
-      try {
-         return new Blob([buffer], { type: "application/zip" }).size === 0;
-      }
-      catch(e) {}
-
-      try {
-         var builder = new (window.BlobBuilder || window.WebKitBlobBuilder ||
-                            window.MozBlobBuilder || window.MSBlobBuilder)();
-         builder.append(buffer);
-         return builder.getBlob('application/zip').size === 0;
-      }
-      catch(e) {}
-
-      return false;
-   })()
-};
-
-JSZip.utils = {
-   /**
-    * Convert a string to a "binary string" : a string containing only char codes between 0 and 255.
-    * @param {string} str the string to transform.
-    * @return {String} the binary string.
-    */
-   string2binary : function (str) {
-      var result = "";
-      for (var i = 0; i < str.length; i++) {
-         result += String.fromCharCode(str.charCodeAt(i) & 0xff);
-      }
-      return result;
-   },
-   /**
-    * Create a Uint8Array from the string.
-    * @param {string} str the string to transform.
-    * @return {Uint8Array} the typed array.
-    * @throws {Error} an Error if the browser doesn't support the requested feature.
-    */
-   string2Uint8Array : function (str) {
-      if (!JSZip.support.uint8array) {
-         throw new Error("Uint8Array is not supported by this browser");
-      }
-      var buffer = new ArrayBuffer(str.length);
-      var bufferView = new Uint8Array(buffer);
-      for(var i = 0; i < str.length; i++) {
-         bufferView[i] = str.charCodeAt(i);
-      }
-
-      return bufferView;
-   },
-
-   /**
-    * Create a string from the Uint8Array.
-    * @param {Uint8Array} array the array to transform.
-    * @return {string} the string.
-    * @throws {Error} an Error if the browser doesn't support the requested feature.
-    */
-   uint8Array2String : function (array) {
-      if (!JSZip.support.uint8array) {
-         throw new Error("Uint8Array is not supported by this browser");
-      }
-      var result = "";
-      for(var i = 0; i < array.length; i++) {
-         result += String.fromCharCode(array[i]);
-      }
-
-      return result;
-   },
-   /**
-    * Create a blob from the given string.
-    * @param {string} str the string to transform.
-    * @return {Blob} the string.
-    * @throws {Error} an Error if the browser doesn't support the requested feature.
-    */
-   string2Blob : function (str) {
-      if (!JSZip.support.blob) {
-         throw new Error("Blob is not supported by this browser");
-      }
-
-      var buffer = JSZip.utils.string2Uint8Array(str).buffer;
-      try {
-         // Blob constructor
-         return new Blob([buffer], { type: "application/zip" });
-      }
-      catch(e) {}
-
-      try {
-         // deprecated, browser only, old way
-         var builder = new (window.BlobBuilder || window.WebKitBlobBuilder ||
-                            window.MozBlobBuilder || window.MSBlobBuilder)();
-         builder.append(buffer);
-         return builder.getBlob('application/zip');
-      }
-      catch(e) {}
-
-      // well, fuck ?!
-      throw new Error("Bug : can't construct the Blob.");
-   }
-};
-
-/**
- *
- *  Base64 encode / decode
- *  http://www.webtoolkit.info/
- *
- *  Hacked so that it doesn't utf8 en/decode everything
- **/
-var JSZipBase64 = (function() {
-   // private property
-   var _keyStr = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
-
-   return {
-      // public method for encoding
-      encode : function(input, utf8) {
-         var output = "";
-         var chr1, chr2, chr3, enc1, enc2, enc3, enc4;
-         var i = 0;
-
-         while (i < input.length) {
-
-            chr1 = input.charCodeAt(i++);
-            chr2 = input.charCodeAt(i++);
-            chr3 = input.charCodeAt(i++);
-
-            enc1 = chr1 >> 2;
-            enc2 = ((chr1 & 3) << 4) | (chr2 >> 4);
-            enc3 = ((chr2 & 15) << 2) | (chr3 >> 6);
-            enc4 = chr3 & 63;
-
-            if (isNaN(chr2)) {
-               enc3 = enc4 = 64;
-            } else if (isNaN(chr3)) {
-               enc4 = 64;
-            }
-
-            output = output +
-               _keyStr.charAt(enc1) + _keyStr.charAt(enc2) +
-               _keyStr.charAt(enc3) + _keyStr.charAt(enc4);
-
-         }
-
-         return output;
-      },
-
-      // public method for decoding
-      decode : function(input, utf8) {
-         var output = "";
-         var chr1, chr2, chr3;
-         var enc1, enc2, enc3, enc4;
-         var i = 0;
-
-         input = input.replace(/[^A-Za-z0-9\+\/\=]/g, "");
-
-         while (i < input.length) {
-
-            enc1 = _keyStr.indexOf(input.charAt(i++));
-            enc2 = _keyStr.indexOf(input.charAt(i++));
-            enc3 = _keyStr.indexOf(input.charAt(i++));
-            enc4 = _keyStr.indexOf(input.charAt(i++));
-
-            chr1 = (enc1 << 2) | (enc2 >> 4);
-            chr2 = ((enc2 & 15) << 4) | (enc3 >> 2);
-            chr3 = ((enc3 & 3) << 6) | enc4;
-
-            output = output + String.fromCharCode(chr1);
-
-            if (enc3 != 64) {
-               output = output + String.fromCharCode(chr2);
-            }
-            if (enc4 != 64) {
-               output = output + String.fromCharCode(chr3);
-            }
-
-         }
-
-         return output;
-
-      }
-   };
-}());
-
-// enforcing Stuk's coding style
-// vim: set shiftwidth=3 softtabstop=3:
-/*
- * Port of a script by Masanao Izumo.
- *
- * Only changes : wrap all the variables in a function and add the 
- * main function to JSZip (DEFLATE compression method).
- * Everything else was written by M. Izumo.
- *
- * Original code can be found here: http://www.onicos.com/staff/iz/amuse/javascript/expert/deflate.txt
- */
-
-if(!JSZip) {
-   throw "JSZip not defined";
-}
-
-/*
- * Original:
- *   http://www.onicos.com/staff/iz/amuse/javascript/expert/deflate.txt
- */
-
-(function(){
-
-/* Copyright (C) 1999 Masanao Izumo <iz@onicos.co.jp>
- * Version: 1.0.1
- * LastModified: Dec 25 1999
- */
-
-/* Interface:
- * data = zip_deflate(src);
- */
-
-/* constant parameters */
-var zip_WSIZE = 32768;		// Sliding Window size
-var zip_STORED_BLOCK = 0;
-var zip_STATIC_TREES = 1;
-var zip_DYN_TREES    = 2;
-
-/* for deflate */
-var zip_DEFAULT_LEVEL = 6;
-var zip_FULL_SEARCH = true;
-var zip_INBUFSIZ = 32768;	// Input buffer size
-var zip_INBUF_EXTRA = 64;	// Extra buffer
-var zip_OUTBUFSIZ = 1024 * 8;
-var zip_window_size = 2 * zip_WSIZE;
-var zip_MIN_MATCH = 3;
-var zip_MAX_MATCH = 258;
-var zip_BITS = 16;
-// for SMALL_MEM
-var zip_LIT_BUFSIZE = 0x2000;
-var zip_HASH_BITS = 13;
-// for MEDIUM_MEM
-// var zip_LIT_BUFSIZE = 0x4000;
-// var zip_HASH_BITS = 14;
-// for BIG_MEM
-// var zip_LIT_BUFSIZE = 0x8000;
-// var zip_HASH_BITS = 15;
-if(zip_LIT_BUFSIZE > zip_INBUFSIZ)
-    alert("error: zip_INBUFSIZ is too small");
-if((zip_WSIZE<<1) > (1<<zip_BITS))
-    alert("error: zip_WSIZE is too large");
-if(zip_HASH_BITS > zip_BITS-1)
-    alert("error: zip_HASH_BITS is too large");
-if(zip_HASH_BITS < 8 || zip_MAX_MATCH != 258)
-    alert("error: Code too clever");
-var zip_DIST_BUFSIZE = zip_LIT_BUFSIZE;
-var zip_HASH_SIZE = 1 << zip_HASH_BITS;
-var zip_HASH_MASK = zip_HASH_SIZE - 1;
-var zip_WMASK = zip_WSIZE - 1;
-var zip_NIL = 0; // Tail of hash chains
-var zip_TOO_FAR = 4096;
-var zip_MIN_LOOKAHEAD = zip_MAX_MATCH + zip_MIN_MATCH + 1;
-var zip_MAX_DIST = zip_WSIZE - zip_MIN_LOOKAHEAD;
-var zip_SMALLEST = 1;
-var zip_MAX_BITS = 15;
-var zip_MAX_BL_BITS = 7;
-var zip_LENGTH_CODES = 29;
-var zip_LITERALS =256;
-var zip_END_BLOCK = 256;
-var zip_L_CODES = zip_LITERALS + 1 + zip_LENGTH_CODES;
-var zip_D_CODES = 30;
-var zip_BL_CODES = 19;
-var zip_REP_3_6 = 16;
-var zip_REPZ_3_10 = 17;
-var zip_REPZ_11_138 = 18;
-var zip_HEAP_SIZE = 2 * zip_L_CODES + 1;
-var zip_H_SHIFT = parseInt((zip_HASH_BITS + zip_MIN_MATCH - 1) /
-			   zip_MIN_MATCH);
-
-/* variables */
-var zip_free_queue;
-var zip_qhead, zip_qtail;
-var zip_initflag;
-var zip_outbuf = null;
-var zip_outcnt, zip_outoff;
-var zip_complete;
-var zip_window;
-var zip_d_buf;
-var zip_l_buf;
-var zip_prev;
-var zip_bi_buf;
-var zip_bi_valid;
-var zip_block_start;
-var zip_ins_h;
-var zip_hash_head;
-var zip_prev_match;
-var zip_match_available;
-var zip_match_length;
-var zip_prev_length;
-var zip_strstart;
-var zip_match_start;
-var zip_eofile;
-var zip_lookahead;
-var zip_max_chain_length;
-var zip_max_lazy_match;
-var zip_compr_level;
-var zip_good_match;
-var zip_nice_match;
-var zip_dyn_ltree;
-var zip_dyn_dtree;
-var zip_static_ltree;
-var zip_static_dtree;
-var zip_bl_tree;
-var zip_l_desc;
-var zip_d_desc;
-var zip_bl_desc;
-var zip_bl_count;
-var zip_heap;
-var zip_heap_len;
-var zip_heap_max;
-var zip_depth;
-var zip_length_code;
-var zip_dist_code;
-var zip_base_length;
-var zip_base_dist;
-var zip_flag_buf;
-var zip_last_lit;
-var zip_last_dist;
-var zip_last_flags;
-var zip_flags;
-var zip_flag_bit;
-var zip_opt_len;
-var zip_static_len;
-var zip_deflate_data;
-var zip_deflate_pos;
-
-/* objects (deflate) */
-
-var zip_DeflateCT = function() {
-    this.fc = 0; // frequency count or bit string
-    this.dl = 0; // father node in Huffman tree or length of bit string
-}
-
-var zip_DeflateTreeDesc = function() {
-    this.dyn_tree = null;	// the dynamic tree
-    this.static_tree = null;	// corresponding static tree or NULL
-    this.extra_bits = null;	// extra bits for each code or NULL
-    this.extra_base = 0;	// base index for extra_bits
-    this.elems = 0;		// max number of elements in the tree
-    this.max_length = 0;	// max bit length for the codes
-    this.max_code = 0;		// largest code with non zero frequency
-}
-
-/* Values for max_lazy_match, good_match and max_chain_length, depending on
- * the desired pack level (0..9). The values given below have been tuned to
- * exclude worst case performance for pathological files. Better values may be
- * found for specific files.
- */
-var zip_DeflateConfiguration = function(a, b, c, d) {
-    this.good_length = a; // reduce lazy search above this match length
-    this.max_lazy = b;    // do not perform lazy search above this match length
-    this.nice_length = c; // quit search above this match length
-    this.max_chain = d;
-}
-
-var zip_DeflateBuffer = function() {
-    this.next = null;
-    this.len = 0;
-    this.ptr = new Array(zip_OUTBUFSIZ);
-    this.off = 0;
-}
-
-/* constant tables */
-var zip_extra_lbits = new Array(
-    0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0);
-var zip_extra_dbits = new Array(
-    0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13);
-var zip_extra_blbits = new Array(
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,3,7);
-var zip_bl_order = new Array(
-    16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15);
-var zip_configuration_table = new Array(
-	new zip_DeflateConfiguration(0,    0,   0,    0),
-	new zip_DeflateConfiguration(4,    4,   8,    4),
-	new zip_DeflateConfiguration(4,    5,  16,    8),
-	new zip_DeflateConfiguration(4,    6,  32,   32),
-	new zip_DeflateConfiguration(4,    4,  16,   16),
-	new zip_DeflateConfiguration(8,   16,  32,   32),
-	new zip_DeflateConfiguration(8,   16, 128,  128),
-	new zip_DeflateConfiguration(8,   32, 128,  256),
-	new zip_DeflateConfiguration(32, 128, 258, 1024),
-	new zip_DeflateConfiguration(32, 258, 258, 4096));
-
-
-/* routines (deflate) */
-
-var zip_deflate_start = function(level) {
-    var i;
-
-    if(!level)
-	level = zip_DEFAULT_LEVEL;
-    else if(level < 1)
-	level = 1;
-    else if(level > 9)
-	level = 9;
-
-    zip_compr_level = level;
-    zip_initflag = false;
-    zip_eofile = false;
-    if(zip_outbuf != null)
-	return;
-
-    zip_free_queue = zip_qhead = zip_qtail = null;
-    zip_outbuf = new Array(zip_OUTBUFSIZ);
-    zip_window = new Array(zip_window_size);
-    zip_d_buf = new Array(zip_DIST_BUFSIZE);
-    zip_l_buf = new Array(zip_INBUFSIZ + zip_INBUF_EXTRA);
-    zip_prev = new Array(1 << zip_BITS);
-    zip_dyn_ltree = new Array(zip_HEAP_SIZE);
-    for(i = 0; i < zip_HEAP_SIZE; i++)
-	zip_dyn_ltree[i] = new zip_DeflateCT();
-    zip_dyn_dtree = new Array(2*zip_D_CODES+1);
-    for(i = 0; i < 2*zip_D_CODES+1; i++)
-	zip_dyn_dtree[i] = new zip_DeflateCT();
-    zip_static_ltree = new Array(zip_L_CODES+2);
-    for(i = 0; i < zip_L_CODES+2; i++)
-	zip_static_ltree[i] = new zip_DeflateCT();
-    zip_static_dtree = new Array(zip_D_CODES);
-    for(i = 0; i < zip_D_CODES; i++)
-	zip_static_dtree[i] = new zip_DeflateCT();
-    zip_bl_tree = new Array(2*zip_BL_CODES+1);
-    for(i = 0; i < 2*zip_BL_CODES+1; i++)
-	zip_bl_tree[i] = new zip_DeflateCT();
-    zip_l_desc = new zip_DeflateTreeDesc();
-    zip_d_desc = new zip_DeflateTreeDesc();
-    zip_bl_desc = new zip_DeflateTreeDesc();
-    zip_bl_count = new Array(zip_MAX_BITS+1);
-    zip_heap = new Array(2*zip_L_CODES+1);
-    zip_depth = new Array(2*zip_L_CODES+1);
-    zip_length_code = new Array(zip_MAX_MATCH-zip_MIN_MATCH+1);
-    zip_dist_code = new Array(512);
-    zip_base_length = new Array(zip_LENGTH_CODES);
-    zip_base_dist = new Array(zip_D_CODES);
-    zip_flag_buf = new Array(parseInt(zip_LIT_BUFSIZE / 8));
-}
-
-var zip_deflate_end = function() {
-    zip_free_queue = zip_qhead = zip_qtail = null;
-    zip_outbuf = null;
-    zip_window = null;
-    zip_d_buf = null;
-    zip_l_buf = null;
-    zip_prev = null;
-    zip_dyn_ltree = null;
-    zip_dyn_dtree = null;
-    zip_static_ltree = null;
-    zip_static_dtree = null;
-    zip_bl_tree = null;
-    zip_l_desc = null;
-    zip_d_desc = null;
-    zip_bl_desc = null;
-    zip_bl_count = null;
-    zip_heap = null;
-    zip_depth = null;
-    zip_length_code = null;
-    zip_dist_code = null;
-    zip_base_length = null;
-    zip_base_dist = null;
-    zip_flag_buf = null;
-}
-
-var zip_reuse_queue = function(p) {
-    p.next = zip_free_queue;
-    zip_free_queue = p;
-}
-
-var zip_new_queue = function() {
-    var p;
-
-    if(zip_free_queue != null)
-    {
-	p = zip_free_queue;
-	zip_free_queue = zip_free_queue.next;
-    }
-    else
-	p = new zip_DeflateBuffer();
-    p.next = null;
-    p.len = p.off = 0;
-
-    return p;
-}
-
-var zip_head1 = function(i) {
-    return zip_prev[zip_WSIZE + i];
-}
-
-var zip_head2 = function(i, val) {
-    return zip_prev[zip_WSIZE + i] = val;
-}
-
-/* put_byte is used for the compressed output, put_ubyte for the
- * uncompressed output. However unlzw() uses window for its
- * suffix table instead of its output buffer, so it does not use put_ubyte
- * (to be cleaned up).
- */
-var zip_put_byte = function(c) {
-    zip_outbuf[zip_outoff + zip_outcnt++] = c;
-    if(zip_outoff + zip_outcnt == zip_OUTBUFSIZ)
-	zip_qoutbuf();
-}
-
-/* Output a 16 bit value, lsb first */
-var zip_put_short = function(w) {
-    w &= 0xffff;
-    if(zip_outoff + zip_outcnt < zip_OUTBUFSIZ - 2) {
-	zip_outbuf[zip_outoff + zip_outcnt++] = (w & 0xff);
-	zip_outbuf[zip_outoff + zip_outcnt++] = (w >>> 8);
-    } else {
-	zip_put_byte(w & 0xff);
-	zip_put_byte(w >>> 8);
-    }
-}
-
-/* ==========================================================================
- * Insert string s in the dictionary and set match_head to the previous head
- * of the hash chain (the most recent string with same hash key). Return
- * the previous length of the hash chain.
- * IN  assertion: all calls to to INSERT_STRING are made with consecutive
- *    input characters and the first MIN_MATCH bytes of s are valid
- *    (except for the last MIN_MATCH-1 bytes of the input file).
- */
-var zip_INSERT_STRING = function() {
-    zip_ins_h = ((zip_ins_h << zip_H_SHIFT)
-		 ^ (zip_window[zip_strstart + zip_MIN_MATCH - 1] & 0xff))
-	& zip_HASH_MASK;
-    zip_hash_head = zip_head1(zip_ins_h);
-    zip_prev[zip_strstart & zip_WMASK] = zip_hash_head;
-    zip_head2(zip_ins_h, zip_strstart);
-}
-
-/* Send a code of the given tree. c and tree must not have side effects */
-var zip_SEND_CODE = function(c, tree) {
-    zip_send_bits(tree[c].fc, tree[c].dl);
-}
-
-/* Mapping from a distance to a distance code. dist is the distance - 1 and
- * must not have side effects. dist_code[256] and dist_code[257] are never
- * used.
- */
-var zip_D_CODE = function(dist) {
-    return (dist < 256 ? zip_dist_code[dist]
-	    : zip_dist_code[256 + (dist>>7)]) & 0xff;
-}
-
-/* ==========================================================================
- * Compares to subtrees, using the tree depth as tie breaker when
- * the subtrees have equal frequency. This minimizes the worst case length.
- */
-var zip_SMALLER = function(tree, n, m) {
-    return tree[n].fc < tree[m].fc ||
-      (tree[n].fc == tree[m].fc && zip_depth[n] <= zip_depth[m]);
-}
-
-/* ==========================================================================
- * read string data
- */
-var zip_read_buff = function(buff, offset, n) {
-    var i;
-    for(i = 0; i < n && zip_deflate_pos < zip_deflate_data.length; i++)
-	buff[offset + i] =
-	    zip_deflate_data.charCodeAt(zip_deflate_pos++) & 0xff;
-    return i;
-}
-
-/* ==========================================================================
- * Initialize the "longest match" routines for a new file
- */
-var zip_lm_init = function() {
-    var j;
-
-    /* Initialize the hash table. */
-    for(j = 0; j < zip_HASH_SIZE; j++)
-//	zip_head2(j, zip_NIL);
-	zip_prev[zip_WSIZE + j] = 0;
-    /* prev will be initialized on the fly */
-
-    /* Set the default configuration parameters:
-     */
-    zip_max_lazy_match = zip_configuration_table[zip_compr_level].max_lazy;
-    zip_good_match     = zip_configuration_table[zip_compr_level].good_length;
-    if(!zip_FULL_SEARCH)
-	zip_nice_match = zip_configuration_table[zip_compr_level].nice_length;
-    zip_max_chain_length = zip_configuration_table[zip_compr_level].max_chain;
-
-    zip_strstart = 0;
-    zip_block_start = 0;
-
-    zip_lookahead = zip_read_buff(zip_window, 0, 2 * zip_WSIZE);
-    if(zip_lookahead <= 0) {
-	zip_eofile = true;
-	zip_lookahead = 0;
-	return;
-    }
-    zip_eofile = false;
-    /* Make sure that we always have enough lookahead. This is important
-     * if input comes from a device such as a tty.
-     */
-    while(zip_lookahead < zip_MIN_LOOKAHEAD && !zip_eofile)
-	zip_fill_window();
-
-    /* If lookahead < MIN_MATCH, ins_h is garbage, but this is
-     * not important since only literal bytes will be emitted.
-     */
-    zip_ins_h = 0;
-    for(j = 0; j < zip_MIN_MATCH - 1; j++) {
-//      UPDATE_HASH(ins_h, window[j]);
-	zip_ins_h = ((zip_ins_h << zip_H_SHIFT) ^ (zip_window[j] & 0xff)) & zip_HASH_MASK;
-    }
-}
-
-/* ==========================================================================
- * Set match_start to the longest match starting at the given string and
- * return its length. Matches shorter or equal to prev_length are discarded,
- * in which case the result is equal to prev_length and match_start is
- * garbage.
- * IN assertions: cur_match is the head of the hash chain for the current
- *   string (strstart) and its distance is <= MAX_DIST, and prev_length >= 1
- */
-var zip_longest_match = function(cur_match) {
-    var chain_length = zip_max_chain_length; // max hash chain length
-    var scanp = zip_strstart; // current string
-    var matchp;		// matched string
-    var len;		// length of current match
-    var best_len = zip_prev_length;	// best match length so far
-
-    /* Stop when cur_match becomes <= limit. To simplify the code,
-     * we prevent matches with the string of window index 0.
-     */
-    var limit = (zip_strstart > zip_MAX_DIST ? zip_strstart - zip_MAX_DIST : zip_NIL);
-
-    var strendp = zip_strstart + zip_MAX_MATCH;
-    var scan_end1 = zip_window[scanp + best_len - 1];
-    var scan_end  = zip_window[scanp + best_len];
-
-    /* Do not waste too much time if we already have a good match: */
-    if(zip_prev_length >= zip_good_match)
-	chain_length >>= 2;
-
-//  Assert(encoder->strstart <= window_size-MIN_LOOKAHEAD, "insufficient lookahead");
-
-    do {
-//    Assert(cur_match < encoder->strstart, "no future");
-	matchp = cur_match;
-
-	/* Skip to next match if the match length cannot increase
-	    * or if the match length is less than 2:
-	*/
-	if(zip_window[matchp + best_len]	!= scan_end  ||
-	   zip_window[matchp + best_len - 1]	!= scan_end1 ||
-	   zip_window[matchp]			!= zip_window[scanp] ||
-	   zip_window[++matchp]			!= zip_window[scanp + 1]) {
-	    continue;
-	}
-
-	/* The check at best_len-1 can be removed because it will be made
-         * again later. (This heuristic is not always a win.)
-         * It is not necessary to compare scan[2] and match[2] since they
-         * are always equal when the other bytes match, given that
-         * the hash keys are equal and that HASH_BITS >= 8.
-         */
-	scanp += 2;
-	matchp++;
-
-	/* We check for insufficient lookahead only every 8th comparison;
-         * the 256th check will be made at strstart+258.
-         */
-	do {
-	} while(zip_window[++scanp] == zip_window[++matchp] &&
-		zip_window[++scanp] == zip_window[++matchp] &&
-		zip_window[++scanp] == zip_window[++matchp] &&
-		zip_window[++scanp] == zip_window[++matchp] &&
-		zip_window[++scanp] == zip_window[++matchp] &&
-		zip_window[++scanp] == zip_window[++matchp] &&
-		zip_window[++scanp] == zip_window[++matchp] &&
-		zip_window[++scanp] == zip_window[++matchp] &&
-		scanp < strendp);
-
-      len = zip_MAX_MATCH - (strendp - scanp);
-      scanp = strendp - zip_MAX_MATCH;
-
-      if(len > best_len) {
-	  zip_match_start = cur_match;
-	  best_len = len;
-	  if(zip_FULL_SEARCH) {
-	      if(len >= zip_MAX_MATCH) break;
-	  } else {
-	      if(len >= zip_nice_match) break;
-	  }
-
-	  scan_end1  = zip_window[scanp + best_len-1];
-	  scan_end   = zip_window[scanp + best_len];
-      }
-    } while((cur_match = zip_prev[cur_match & zip_WMASK]) > limit
-	    && --chain_length != 0);
-
-    return best_len;
-}
-
-/* ==========================================================================
- * Fill the window when the lookahead becomes insufficient.
- * Updates strstart and lookahead, and sets eofile if end of input file.
- * IN assertion: lookahead < MIN_LOOKAHEAD && strstart + lookahead > 0
- * OUT assertions: at least one byte has been read, or eofile is set;
- *    file reads are performed for at least two bytes (required for the
- *    translate_eol option).
- */
-var zip_fill_window = function() {
-    var n, m;
-
-    // Amount of free space at the end of the window.
-    var more = zip_window_size - zip_lookahead - zip_strstart;
-
-    /* If the window is almost full and there is insufficient lookahead,
-     * move the upper half to the lower one to make room in the upper half.
-     */
-    if(more == -1) {
-	/* Very unlikely, but possible on 16 bit machine if strstart == 0
-         * and lookahead == 1 (input done one byte at time)
-         */
-	more--;
-    } else if(zip_strstart >= zip_WSIZE + zip_MAX_DIST) {
-	/* By the IN assertion, the window is not empty so we can't confuse
-         * more == 0 with more == 64K on a 16 bit machine.
-         */
-//	Assert(window_size == (ulg)2*WSIZE, "no sliding with BIG_MEM");
-
-//	System.arraycopy(window, WSIZE, window, 0, WSIZE);
-	for(n = 0; n < zip_WSIZE; n++)
-	    zip_window[n] = zip_window[n + zip_WSIZE];
-      
-	zip_match_start -= zip_WSIZE;
-	zip_strstart    -= zip_WSIZE; /* we now have strstart >= MAX_DIST: */
-	zip_block_start -= zip_WSIZE;
-
-	for(n = 0; n < zip_HASH_SIZE; n++) {
-	    m = zip_head1(n);
-	    zip_head2(n, m >= zip_WSIZE ? m - zip_WSIZE : zip_NIL);
-	}
-	for(n = 0; n < zip_WSIZE; n++) {
-	    /* If n is not on any hash chain, prev[n] is garbage but
-	     * its value will never be used.
-	     */
-	    m = zip_prev[n];
-	    zip_prev[n] = (m >= zip_WSIZE ? m - zip_WSIZE : zip_NIL);
-	}
-	more += zip_WSIZE;
-    }
-    // At this point, more >= 2
-    if(!zip_eofile) {
-	n = zip_read_buff(zip_window, zip_strstart + zip_lookahead, more);
-	if(n <= 0)
-	    zip_eofile = true;
-	else
-	    zip_lookahead += n;
-    }
-}
-
-/* ==========================================================================
- * Processes a new input file and return its compressed length. This
- * function does not perform lazy evaluationof matches and inserts
- * new strings in the dictionary only for unmatched strings or for short
- * matches. It is used only for the fast compression options.
- */
-var zip_deflate_fast = function() {
-    while(zip_lookahead != 0 && zip_qhead == null) {
-	var flush; // set if current block must be flushed
-
-	/* Insert the string window[strstart .. strstart+2] in the
-	 * dictionary, and set hash_head to the head of the hash chain:
-	 */
-	zip_INSERT_STRING();
-
-	/* Find the longest match, discarding those <= prev_length.
-	 * At this point we have always match_length < MIN_MATCH
-	 */
-	if(zip_hash_head != zip_NIL &&
-	   zip_strstart - zip_hash_head <= zip_MAX_DIST) {
-	    /* To simplify the code, we prevent matches with the string
-	     * of window index 0 (in particular we have to avoid a match
-	     * of the string with itself at the start of the input file).
-	     */
-	    zip_match_length = zip_longest_match(zip_hash_head);
-	    /* longest_match() sets match_start */
-	    if(zip_match_length > zip_lookahead)
-		zip_match_length = zip_lookahead;
-	}
-	if(zip_match_length >= zip_MIN_MATCH) {
-//	    check_match(strstart, match_start, match_length);
-
-	    flush = zip_ct_tally(zip_strstart - zip_match_start,
-				 zip_match_length - zip_MIN_MATCH);
-	    zip_lookahead -= zip_match_length;
-
-	    /* Insert new strings in the hash table only if the match length
-	     * is not too large. This saves time but degrades compression.
-	     */
-	    if(zip_match_length <= zip_max_lazy_match) {
-		zip_match_length--; // string at strstart already in hash table
-		do {
-		    zip_strstart++;
-		    zip_INSERT_STRING();
-		    /* strstart never exceeds WSIZE-MAX_MATCH, so there are
-		     * always MIN_MATCH bytes ahead. If lookahead < MIN_MATCH
-		     * these bytes are garbage, but it does not matter since
-		     * the next lookahead bytes will be emitted as literals.
-		     */
-		} while(--zip_match_length != 0);
-		zip_strstart++;
-	    } else {
-		zip_strstart += zip_match_length;
-		zip_match_length = 0;
-		zip_ins_h = zip_window[zip_strstart] & 0xff;
-//		UPDATE_HASH(ins_h, window[strstart + 1]);
-		zip_ins_h = ((zip_ins_h<<zip_H_SHIFT) ^ (zip_window[zip_strstart + 1] & 0xff)) & zip_HASH_MASK;
-
-//#if MIN_MATCH != 3
-//		Call UPDATE_HASH() MIN_MATCH-3 more times
-//#endif
-
-	    }
-	} else {
-	    /* No match, output a literal byte */
-	    flush = zip_ct_tally(0, zip_window[zip_strstart] & 0xff);
-	    zip_lookahead--;
-	    zip_strstart++;
-	}
-	if(flush) {
-	    zip_flush_block(0);
-	    zip_block_start = zip_strstart;
-	}
-
-	/* Make sure that we always have enough lookahead, except
-	 * at the end of the input file. We need MAX_MATCH bytes
-	 * for the next match, plus MIN_MATCH bytes to insert the
-	 * string following the next match.
-	 */
-	while(zip_lookahead < zip_MIN_LOOKAHEAD && !zip_eofile)
-	    zip_fill_window();
-    }
-}
-
-var zip_deflate_better = function() {
-    /* Process the input block. */
-    while(zip_lookahead != 0 && zip_qhead == null) {
-	/* Insert the string window[strstart .. strstart+2] in the
-	 * dictionary, and set hash_head to the head of the hash chain:
-	 */
-	zip_INSERT_STRING();
-
-	/* Find the longest match, discarding those <= prev_length.
-	 */
-	zip_prev_length = zip_match_length;
-	zip_prev_match = zip_match_start;
-	zip_match_length = zip_MIN_MATCH - 1;
-
-	if(zip_hash_head != zip_NIL &&
-	   zip_prev_length < zip_max_lazy_match &&
-	   zip_strstart - zip_hash_head <= zip_MAX_DIST) {
-	    /* To simplify the code, we prevent matches with the string
-	     * of window index 0 (in particular we have to avoid a match
-	     * of the string with itself at the start of the input file).
-	     */
-	    zip_match_length = zip_longest_match(zip_hash_head);
-	    /* longest_match() sets match_start */
-	    if(zip_match_length > zip_lookahead)
-		zip_match_length = zip_lookahead;
-
-	    /* Ignore a length 3 match if it is too distant: */
-	    if(zip_match_length == zip_MIN_MATCH &&
-	       zip_strstart - zip_match_start > zip_TOO_FAR) {
-		/* If prev_match is also MIN_MATCH, match_start is garbage
-		 * but we will ignore the current match anyway.
-		 */
-		zip_match_length--;
-	    }
-	}
-	/* If there was a match at the previous step and the current
-	 * match is not better, output the previous match:
-	 */
-	if(zip_prev_length >= zip_MIN_MATCH &&
-	   zip_match_length <= zip_prev_length) {
-	    var flush; // set if current block must be flushed
-
-//	    check_match(strstart - 1, prev_match, prev_length);
-	    flush = zip_ct_tally(zip_strstart - 1 - zip_prev_match,
-				 zip_prev_length - zip_MIN_MATCH);
-
-	    /* Insert in hash table all strings up to the end of the match.
-	     * strstart-1 and strstart are already inserted.
-	     */
-	    zip_lookahead -= zip_prev_length - 1;
-	    zip_prev_length -= 2;
-	    do {
-		zip_strstart++;
-		zip_INSERT_STRING();
-		/* strstart never exceeds WSIZE-MAX_MATCH, so there are
-		 * always MIN_MATCH bytes ahead. If lookahead < MIN_MATCH
-		 * these bytes are garbage, but it does not matter since the
-		 * next lookahead bytes will always be emitted as literals.
-		 */
-	    } while(--zip_prev_length != 0);
-	    zip_match_available = 0;
-	    zip_match_length = zip_MIN_MATCH - 1;
-	    zip_strstart++;
-	    if(flush) {
-		zip_flush_block(0);
-		zip_block_start = zip_strstart;
-	    }
-	} else if(zip_match_available != 0) {
-	    /* If there was no match at the previous position, output a
-	     * single literal. If there was a match but the current match
-	     * is longer, truncate the previous match to a single literal.
-	     */
-	    if(zip_ct_tally(0, zip_window[zip_strstart - 1] & 0xff)) {
-		zip_flush_block(0);
-		zip_block_start = zip_strstart;
-	    }
-	    zip_strstart++;
-	    zip_lookahead--;
-	} else {
-	    /* There is no previous match to compare with, wait for
-	     * the next step to decide.
-	     */
-	    zip_match_available = 1;
-	    zip_strstart++;
-	    zip_lookahead--;
-	}
-
-	/* Make sure that we always have enough lookahead, except
-	 * at the end of the input file. We need MAX_MATCH bytes
-	 * for the next match, plus MIN_MATCH bytes to insert the
-	 * string following the next match.
-	 */
-	while(zip_lookahead < zip_MIN_LOOKAHEAD && !zip_eofile)
-	    zip_fill_window();
-    }
-}
-
-var zip_init_deflate = function() {
-    if(zip_eofile)
-	return;
-    zip_bi_buf = 0;
-    zip_bi_valid = 0;
-    zip_ct_init();
-    zip_lm_init();
-
-    zip_qhead = null;
-    zip_outcnt = 0;
-    zip_outoff = 0;
-
-    if(zip_compr_level <= 3)
-    {
-	zip_prev_length = zip_MIN_MATCH - 1;
-	zip_match_length = 0;
-    }
-    else
-    {
-	zip_match_length = zip_MIN_MATCH - 1;
-	zip_match_available = 0;
-    }
-
-    zip_complete = false;
-}
-
-/* ==========================================================================
- * Same as above, but achieves better compression. We use a lazy
- * evaluation for matches: a match is finally adopted only if there is
- * no better match at the next window position.
- */
-var zip_deflate_internal = function(buff, off, buff_size) {
-    var n;
-
-    if(!zip_initflag)
-    {
-	zip_init_deflate();
-	zip_initflag = true;
-	if(zip_lookahead == 0) { // empty
-	    zip_complete = true;
-	    return 0;
-	}
-    }
-
-    if((n = zip_qcopy(buff, off, buff_size)) == buff_size)
-	return buff_size;
-
-    if(zip_complete)
-	return n;
-
-    if(zip_compr_level <= 3) // optimized for speed
-	zip_deflate_fast();
-    else
-	zip_deflate_better();
-    if(zip_lookahead == 0) {
-	if(zip_match_available != 0)
-	    zip_ct_tally(0, zip_window[zip_strstart - 1] & 0xff);
-	zip_flush_block(1);
-	zip_complete = true;
-    }
-    return n + zip_qcopy(buff, n + off, buff_size - n);
-}
-
-var zip_qcopy = function(buff, off, buff_size) {
-    var n, i, j;
-
-    n = 0;
-    while(zip_qhead != null && n < buff_size)
-    {
-	i = buff_size - n;
-	if(i > zip_qhead.len)
-	    i = zip_qhead.len;
-//      System.arraycopy(qhead.ptr, qhead.off, buff, off + n, i);
-	for(j = 0; j < i; j++)
-	    buff[off + n + j] = zip_qhead.ptr[zip_qhead.off + j];
-	
-	zip_qhead.off += i;
-	zip_qhead.len -= i;
-	n += i;
-	if(zip_qhead.len == 0) {
-	    var p;
-	    p = zip_qhead;
-	    zip_qhead = zip_qhead.next;
-	    zip_reuse_queue(p);
-	}
-    }
-
-    if(n == buff_size)
-	return n;
-
-    if(zip_outoff < zip_outcnt) {
-	i = buff_size - n;
-	if(i > zip_outcnt - zip_outoff)
-	    i = zip_outcnt - zip_outoff;
-	// System.arraycopy(outbuf, outoff, buff, off + n, i);
-	for(j = 0; j < i; j++)
-	    buff[off + n + j] = zip_outbuf[zip_outoff + j];
-	zip_outoff += i;
-	n += i;
-	if(zip_outcnt == zip_outoff)
-	    zip_outcnt = zip_outoff = 0;
-    }
-    return n;
-}
-
-/* ==========================================================================
- * Allocate the match buffer, initialize the various tables and save the
- * location of the internal file attribute (ascii/binary) and method
- * (DEFLATE/STORE).
- */
-var zip_ct_init = function() {
-    var n;	// iterates over tree elements
-    var bits;	// bit counter
-    var length;	// length value
-    var code;	// code value
-    var dist;	// distance index
-
-    if(zip_static_dtree[0].dl != 0) return; // ct_init already called
-
-    zip_l_desc.dyn_tree		= zip_dyn_ltree;
-    zip_l_desc.static_tree	= zip_static_ltree;
-    zip_l_desc.extra_bits	= zip_extra_lbits;
-    zip_l_desc.extra_base	= zip_LITERALS + 1;
-    zip_l_desc.elems		= zip_L_CODES;
-    zip_l_desc.max_length	= zip_MAX_BITS;
-    zip_l_desc.max_code		= 0;
-
-    zip_d_desc.dyn_tree		= zip_dyn_dtree;
-    zip_d_desc.static_tree	= zip_static_dtree;
-    zip_d_desc.extra_bits	= zip_extra_dbits;
-    zip_d_desc.extra_base	= 0;
-    zip_d_desc.elems		= zip_D_CODES;
-    zip_d_desc.max_length	= zip_MAX_BITS;
-    zip_d_desc.max_code		= 0;
-
-    zip_bl_desc.dyn_tree	= zip_bl_tree;
-    zip_bl_desc.static_tree	= null;
-    zip_bl_desc.extra_bits	= zip_extra_blbits;
-    zip_bl_desc.extra_base	= 0;
-    zip_bl_desc.elems		= zip_BL_CODES;
-    zip_bl_desc.max_length	= zip_MAX_BL_BITS;
-    zip_bl_desc.max_code	= 0;
-
-    // Initialize the mapping length (0..255) -> length code (0..28)
-    length = 0;
-    for(code = 0; code < zip_LENGTH_CODES-1; code++) {
-	zip_base_length[code] = length;
-	for(n = 0; n < (1<<zip_extra_lbits[code]); n++)
-	    zip_length_code[length++] = code;
-    }
-    // Assert (length == 256, "ct_init: length != 256");
-
-    /* Note that the length 255 (match length 258) can be represented
-     * in two different ways: code 284 + 5 bits or code 285, so we
-     * overwrite length_code[255] to use the best encoding:
-     */
-    zip_length_code[length-1] = code;
-
-    /* Initialize the mapping dist (0..32K) -> dist code (0..29) */
-    dist = 0;
-    for(code = 0 ; code < 16; code++) {
-	zip_base_dist[code] = dist;
-	for(n = 0; n < (1<<zip_extra_dbits[code]); n++) {
-	    zip_dist_code[dist++] = code;
-	}
-    }
-    // Assert (dist == 256, "ct_init: dist != 256");
-    dist >>= 7; // from now on, all distances are divided by 128
-    for( ; code < zip_D_CODES; code++) {
-	zip_base_dist[code] = dist << 7;
-	for(n = 0; n < (1<<(zip_extra_dbits[code]-7)); n++)
-	    zip_dist_code[256 + dist++] = code;
-    }
-    // Assert (dist == 256, "ct_init: 256+dist != 512");
-
-    // Construct the codes of the static literal tree
-    for(bits = 0; bits <= zip_MAX_BITS; bits++)
-	zip_bl_count[bits] = 0;
-    n = 0;
-    while(n <= 143) { zip_static_ltree[n++].dl = 8; zip_bl_count[8]++; }
-    while(n <= 255) { zip_static_ltree[n++].dl = 9; zip_bl_count[9]++; }
-    while(n <= 279) { zip_static_ltree[n++].dl = 7; zip_bl_count[7]++; }
-    while(n <= 287) { zip_static_ltree[n++].dl = 8; zip_bl_count[8]++; }
-    /* Codes 286 and 287 do not exist, but we must include them in the
-     * tree construction to get a canonical Huffman tree (longest code
-     * all ones)
-     */
-    zip_gen_codes(zip_static_ltree, zip_L_CODES + 1);
-
-    /* The static distance tree is trivial: */
-    for(n = 0; n < zip_D_CODES; n++) {
-	zip_static_dtree[n].dl = 5;
-	zip_static_dtree[n].fc = zip_bi_reverse(n, 5);
-    }
-
-    // Initialize the first block of the first file:
-    zip_init_block();
-}
-
-/* ==========================================================================
- * Initialize a new block.
- */
-var zip_init_block = function() {
-    var n; // iterates over tree elements
-
-    // Initialize the trees.
-    for(n = 0; n < zip_L_CODES;  n++) zip_dyn_ltree[n].fc = 0;
-    for(n = 0; n < zip_D_CODES;  n++) zip_dyn_dtree[n].fc = 0;
-    for(n = 0; n < zip_BL_CODES; n++) zip_bl_tree[n].fc = 0;
-
-    zip_dyn_ltree[zip_END_BLOCK].fc = 1;
-    zip_opt_len = zip_static_len = 0;
-    zip_last_lit = zip_last_dist = zip_last_flags = 0;
-    zip_flags = 0;
-    zip_flag_bit = 1;
-}
-
-/* ==========================================================================
- * Restore the heap property by moving down the tree starting at node k,
- * exchanging a node with the smallest of its two sons if necessary, stopping
- * when the heap property is re-established (each father smaller than its
- * two sons).
- */
-var zip_pqdownheap = function(
-    tree,	// the tree to restore
-    k) {	// node to move down
-    var v = zip_heap[k];
-    var j = k << 1;	// left son of k
-
-    while(j <= zip_heap_len) {
-	// Set j to the smallest of the two sons:
-	if(j < zip_heap_len &&
-	   zip_SMALLER(tree, zip_heap[j + 1], zip_heap[j]))
-	    j++;
-
-	// Exit if v is smaller than both sons
-	if(zip_SMALLER(tree, v, zip_heap[j]))
-	    break;
-
-	// Exchange v with the smallest son
-	zip_heap[k] = zip_heap[j];
-	k = j;
-
-	// And continue down the tree, setting j to the left son of k
-	j <<= 1;
-    }
-    zip_heap[k] = v;
-}
-
-/* ==========================================================================
- * Compute the optimal bit lengths for a tree and update the total bit length
- * for the current block.
- * IN assertion: the fields freq and dad are set, heap[heap_max] and
- *    above are the tree nodes sorted by increasing frequency.
- * OUT assertions: the field len is set to the optimal bit length, the
- *     array bl_count contains the frequencies for each bit length.
- *     The length opt_len is updated; static_len is also updated if stree is
- *     not null.
- */
-var zip_gen_bitlen = function(desc) { // the tree descriptor
-    var tree		= desc.dyn_tree;
-    var extra		= desc.extra_bits;
-    var base		= desc.extra_base;
-    var max_code	= desc.max_code;
-    var max_length	= desc.max_length;
-    var stree		= desc.static_tree;
-    var h;		// heap index
-    var n, m;		// iterate over the tree elements
-    var bits;		// bit length
-    var xbits;		// extra bits
-    var f;		// frequency
-    var overflow = 0;	// number of elements with bit length too large
-
-    for(bits = 0; bits <= zip_MAX_BITS; bits++)
-	zip_bl_count[bits] = 0;
-
-    /* In a first pass, compute the optimal bit lengths (which may
-     * overflow in the case of the bit length tree).
-     */
-    tree[zip_heap[zip_heap_max]].dl = 0; // root of the heap
-
-    for(h = zip_heap_max + 1; h < zip_HEAP_SIZE; h++) {
-	n = zip_heap[h];
-	bits = tree[tree[n].dl].dl + 1;
-	if(bits > max_length) {
-	    bits = max_length;
-	    overflow++;
-	}
-	tree[n].dl = bits;
-	// We overwrite tree[n].dl which is no longer needed
-
-	if(n > max_code)
-	    continue; // not a leaf node
-
-	zip_bl_count[bits]++;
-	xbits = 0;
-	if(n >= base)
-	    xbits = extra[n - base];
-	f = tree[n].fc;
-	zip_opt_len += f * (bits + xbits);
-	if(stree != null)
-	    zip_static_len += f * (stree[n].dl + xbits);
-    }
-    if(overflow == 0)
-	return;
-
-    // This happens for example on obj2 and pic of the Calgary corpus
-
-    // Find the first bit length which could increase:
-    do {
-	bits = max_length - 1;
-	while(zip_bl_count[bits] == 0)
-	    bits--;
-	zip_bl_count[bits]--;		// move one leaf down the tree
-	zip_bl_count[bits + 1] += 2;	// move one overflow item as its brother
-	zip_bl_count[max_length]--;
-	/* The brother of the overflow item also moves one step up,
-	 * but this does not affect bl_count[max_length]
-	 */
-	overflow -= 2;
-    } while(overflow > 0);
-
-    /* Now recompute all bit lengths, scanning in increasing frequency.
-     * h is still equal to HEAP_SIZE. (It is simpler to reconstruct all
-     * lengths instead of fixing only the wrong ones. This idea is taken
-     * from 'ar' written by Haruhiko Okumura.)
-     */
-    for(bits = max_length; bits != 0; bits--) {
-	n = zip_bl_count[bits];
-	while(n != 0) {
-	    m = zip_heap[--h];
-	    if(m > max_code)
-		continue;
-	    if(tree[m].dl != bits) {
-		zip_opt_len += (bits - tree[m].dl) * tree[m].fc;
-		tree[m].fc = bits;
-	    }
-	    n--;
-	}
-    }
-}
-
-  /* ==========================================================================
-   * Generate the codes for a given tree and bit counts (which need not be
-   * optimal).
-   * IN assertion: the array bl_count contains the bit length statistics for
-   * the given tree and the field len is set for all tree elements.
-   * OUT assertion: the field code is set for all tree elements of non
-   *     zero code length.
-   */
-var zip_gen_codes = function(tree,	// the tree to decorate
-		   max_code) {	// largest code with non zero frequency
-    var next_code = new Array(zip_MAX_BITS+1); // next code value for each bit length
-    var code = 0;		// running code value
-    var bits;			// bit index
-    var n;			// code index
-
-    /* The distribution counts are first used to generate the code values
-     * without bit reversal.
-     */
-    for(bits = 1; bits <= zip_MAX_BITS; bits++) {
-	code = ((code + zip_bl_count[bits-1]) << 1);
-	next_code[bits] = code;
-    }
-
-    /* Check that the bit counts in bl_count are consistent. The last code
-     * must be all ones.
-     */
-//    Assert (code + encoder->bl_count[MAX_BITS]-1 == (1<<MAX_BITS)-1,
-//	    "inconsistent bit counts");
-//    Tracev((stderr,"\ngen_codes: max_code %d ", max_code));
-
-    for(n = 0; n <= max_code; n++) {
-	var len = tree[n].dl;
-	if(len == 0)
-	    continue;
-	// Now reverse the bits
-	tree[n].fc = zip_bi_reverse(next_code[len]++, len);
-
-//      Tracec(tree != static_ltree, (stderr,"\nn %3d %c l %2d c %4x (%x) ",
-//	  n, (isgraph(n) ? n : ' '), len, tree[n].fc, next_code[len]-1));
-    }
-}
-
-/* ==========================================================================
- * Construct one Huffman tree and assigns the code bit strings and lengths.
- * Update the total bit length for the current block.
- * IN assertion: the field freq is set for all tree elements.
- * OUT assertions: the fields len and code are set to the optimal bit length
- *     and corresponding code. The length opt_len is updated; static_len is
- *     also updated if stree is not null. The field max_code is set.
- */
-var zip_build_tree = function(desc) { // the tree descriptor
-    var tree	= desc.dyn_tree;
-    var stree	= desc.static_tree;
-    var elems	= desc.elems;
-    var n, m;		// iterate over heap elements
-    var max_code = -1;	// largest code with non zero frequency
-    var node = elems;	// next internal node of the tree
-
-    /* Construct the initial heap, with least frequent element in
-     * heap[SMALLEST]. The sons of heap[n] are heap[2*n] and heap[2*n+1].
-     * heap[0] is not used.
-     */
-    zip_heap_len = 0;
-    zip_heap_max = zip_HEAP_SIZE;
-
-    for(n = 0; n < elems; n++) {
-	if(tree[n].fc != 0) {
-	    zip_heap[++zip_heap_len] = max_code = n;
-	    zip_depth[n] = 0;
-	} else
-	    tree[n].dl = 0;
-    }
-
-    /* The pkzip format requires that at least one distance code exists,
-     * and that at least one bit should be sent even if there is only one
-     * possible code. So to avoid special checks later on we force at least
-     * two codes of non zero frequency.
-     */
-    while(zip_heap_len < 2) {
-	var xnew = zip_heap[++zip_heap_len] = (max_code < 2 ? ++max_code : 0);
-	tree[xnew].fc = 1;
-	zip_depth[xnew] = 0;
-	zip_opt_len--;
-	if(stree != null)
-	    zip_static_len -= stree[xnew].dl;
-	// new is 0 or 1 so it does not have extra bits
-    }
-    desc.max_code = max_code;
-
-    /* The elements heap[heap_len/2+1 .. heap_len] are leaves of the tree,
-     * establish sub-heaps of increasing lengths:
-     */
-    for(n = zip_heap_len >> 1; n >= 1; n--)
-	zip_pqdownheap(tree, n);
-
-    /* Construct the Huffman tree by repeatedly combining the least two
-     * frequent nodes.
-     */
-    do {
-	n = zip_heap[zip_SMALLEST];
-	zip_heap[zip_SMALLEST] = zip_heap[zip_heap_len--];
-	zip_pqdownheap(tree, zip_SMALLEST);
-
-	m = zip_heap[zip_SMALLEST];  // m = node of next least frequency
-
-	// keep the nodes sorted by frequency
-	zip_heap[--zip_heap_max] = n;
-	zip_heap[--zip_heap_max] = m;
-
-	// Create a new node father of n and m
-	tree[node].fc = tree[n].fc + tree[m].fc;
-//	depth[node] = (char)(MAX(depth[n], depth[m]) + 1);
-	if(zip_depth[n] > zip_depth[m] + 1)
-	    zip_depth[node] = zip_depth[n];
-	else
-	    zip_depth[node] = zip_depth[m] + 1;
-	tree[n].dl = tree[m].dl = node;
-
-	// and insert the new node in the heap
-	zip_heap[zip_SMALLEST] = node++;
-	zip_pqdownheap(tree, zip_SMALLEST);
-
-    } while(zip_heap_len >= 2);
-
-    zip_heap[--zip_heap_max] = zip_heap[zip_SMALLEST];
-
-    /* At this point, the fields freq and dad are set. We can now
-     * generate the bit lengths.
-     */
-    zip_gen_bitlen(desc);
-
-    // The field len is now set, we can generate the bit codes
-    zip_gen_codes(tree, max_code);
-}
-
-/* ==========================================================================
- * Scan a literal or distance tree to determine the frequencies of the codes
- * in the bit length tree. Updates opt_len to take into account the repeat
- * counts. (The contribution of the bit length codes will be added later
- * during the construction of bl_tree.)
- */
-var zip_scan_tree = function(tree,// the tree to be scanned
-		       max_code) {  // and its largest code of non zero frequency
-    var n;			// iterates over all tree elements
-    var prevlen = -1;		// last emitted length
-    var curlen;			// length of current code
-    var nextlen = tree[0].dl;	// length of next code
-    var count = 0;		// repeat count of the current code
-    var max_count = 7;		// max repeat count
-    var min_count = 4;		// min repeat count
-
-    if(nextlen == 0) {
-	max_count = 138;
-	min_count = 3;
-    }
-    tree[max_code + 1].dl = 0xffff; // guard
-
-    for(n = 0; n <= max_code; n++) {
-	curlen = nextlen;
-	nextlen = tree[n + 1].dl;
-	if(++count < max_count && curlen == nextlen)
-	    continue;
-	else if(count < min_count)
-	    zip_bl_tree[curlen].fc += count;
-	else if(curlen != 0) {
-	    if(curlen != prevlen)
-		zip_bl_tree[curlen].fc++;
-	    zip_bl_tree[zip_REP_3_6].fc++;
-	} else if(count <= 10)
-	    zip_bl_tree[zip_REPZ_3_10].fc++;
-	else
-	    zip_bl_tree[zip_REPZ_11_138].fc++;
-	count = 0; prevlen = curlen;
-	if(nextlen == 0) {
-	    max_count = 138;
-	    min_count = 3;
-	} else if(curlen == nextlen) {
-	    max_count = 6;
-	    min_count = 3;
-	} else {
-	    max_count = 7;
-	    min_count = 4;
-	}
-    }
-}
-
-  /* ==========================================================================
-   * Send a literal or distance tree in compressed form, using the codes in
-   * bl_tree.
-   */
-var zip_send_tree = function(tree, // the tree to be scanned
-		   max_code) { // and its largest code of non zero frequency
-    var n;			// iterates over all tree elements
-    var prevlen = -1;		// last emitted length
-    var curlen;			// length of current code
-    var nextlen = tree[0].dl;	// length of next code
-    var count = 0;		// repeat count of the current code
-    var max_count = 7;		// max repeat count
-    var min_count = 4;		// min repeat count
-
-    /* tree[max_code+1].dl = -1; */  /* guard already set */
-    if(nextlen == 0) {
-      max_count = 138;
-      min_count = 3;
-    }
-
-    for(n = 0; n <= max_code; n++) {
-	curlen = nextlen;
-	nextlen = tree[n+1].dl;
-	if(++count < max_count && curlen == nextlen) {
-	    continue;
-	} else if(count < min_count) {
-	    do { zip_SEND_CODE(curlen, zip_bl_tree); } while(--count != 0);
-	} else if(curlen != 0) {
-	    if(curlen != prevlen) {
-		zip_SEND_CODE(curlen, zip_bl_tree);
-		count--;
-	    }
-	    // Assert(count >= 3 && count <= 6, " 3_6?");
-	    zip_SEND_CODE(zip_REP_3_6, zip_bl_tree);
-	    zip_send_bits(count - 3, 2);
-	} else if(count <= 10) {
-	    zip_SEND_CODE(zip_REPZ_3_10, zip_bl_tree);
-	    zip_send_bits(count-3, 3);
-	} else {
-	    zip_SEND_CODE(zip_REPZ_11_138, zip_bl_tree);
-	    zip_send_bits(count-11, 7);
-	}
-	count = 0;
-	prevlen = curlen;
-	if(nextlen == 0) {
-	    max_count = 138;
-	    min_count = 3;
-	} else if(curlen == nextlen) {
-	    max_count = 6;
-	    min_count = 3;
-	} else {
-	    max_count = 7;
-	    min_count = 4;
-	}
-    }
-}
-
-/* ==========================================================================
- * Construct the Huffman tree for the bit lengths and return the index in
- * bl_order of the last bit length code to send.
- */
-var zip_build_bl_tree = function() {
-    var max_blindex;  // index of last bit length code of non zero freq
-
-    // Determine the bit length frequencies for literal and distance trees
-    zip_scan_tree(zip_dyn_ltree, zip_l_desc.max_code);
-    zip_scan_tree(zip_dyn_dtree, zip_d_desc.max_code);
-
-    // Build the bit length tree:
-    zip_build_tree(zip_bl_desc);
-    /* opt_len now includes the length of the tree representations, except
-     * the lengths of the bit lengths codes and the 5+5+4 bits for the counts.
-     */
-
-    /* Determine the number of bit length codes to send. The pkzip format
-     * requires that at least 4 bit length codes be sent. (appnote.txt says
-     * 3 but the actual value used is 4.)
-     */
-    for(max_blindex = zip_BL_CODES-1; max_blindex >= 3; max_blindex--) {
-	if(zip_bl_tree[zip_bl_order[max_blindex]].dl != 0) break;
-    }
-    /* Update opt_len to include the bit length tree and counts */
-    zip_opt_len += 3*(max_blindex+1) + 5+5+4;
-//    Tracev((stderr, "\ndyn trees: dyn %ld, stat %ld",
-//	    encoder->opt_len, encoder->static_len));
-
-    return max_blindex;
-}
-
-/* ==========================================================================
- * Send the header for a block using dynamic Huffman trees: the counts, the
- * lengths of the bit length codes, the literal tree and the distance tree.
- * IN assertion: lcodes >= 257, dcodes >= 1, blcodes >= 4.
- */
-var zip_send_all_trees = function(lcodes, dcodes, blcodes) { // number of codes for each tree
-    var rank; // index in bl_order
-
-//    Assert (lcodes >= 257 && dcodes >= 1 && blcodes >= 4, "not enough codes");
-//    Assert (lcodes <= L_CODES && dcodes <= D_CODES && blcodes <= BL_CODES,
-//	    "too many codes");
-//    Tracev((stderr, "\nbl counts: "));
-    zip_send_bits(lcodes-257, 5); // not +255 as stated in appnote.txt
-    zip_send_bits(dcodes-1,   5);
-    zip_send_bits(blcodes-4,  4); // not -3 as stated in appnote.txt
-    for(rank = 0; rank < blcodes; rank++) {
-//      Tracev((stderr, "\nbl code %2d ", bl_order[rank]));
-	zip_send_bits(zip_bl_tree[zip_bl_order[rank]].dl, 3);
-    }
-
-    // send the literal tree
-    zip_send_tree(zip_dyn_ltree,lcodes-1);
-
-    // send the distance tree
-    zip_send_tree(zip_dyn_dtree,dcodes-1);
-}
-
-/* ==========================================================================
- * Determine the best encoding for the current block: dynamic trees, static
- * trees or store, and output the encoded block to the zip file.
- */
-var zip_flush_block = function(eof) { // true if this is the last block for a file
-    var opt_lenb, static_lenb; // opt_len and static_len in bytes
-    var max_blindex;	// index of last bit length code of non zero freq
-    var stored_len;	// length of input block
-
-    stored_len = zip_strstart - zip_block_start;
-    zip_flag_buf[zip_last_flags] = zip_flags; // Save the flags for the last 8 items
-
-    // Construct the literal and distance trees
-    zip_build_tree(zip_l_desc);
-//    Tracev((stderr, "\nlit data: dyn %ld, stat %ld",
-//	    encoder->opt_len, encoder->static_len));
-
-    zip_build_tree(zip_d_desc);
-//    Tracev((stderr, "\ndist data: dyn %ld, stat %ld",
-//	    encoder->opt_len, encoder->static_len));
-    /* At this point, opt_len and static_len are the total bit lengths of
-     * the compressed block data, excluding the tree representations.
-     */
-
-    /* Build the bit length tree for the above two trees, and get the index
-     * in bl_order of the last bit length code to send.
-     */
-    max_blindex = zip_build_bl_tree();
-
-    // Determine the best encoding. Compute first the block length in bytes
-    opt_lenb	= (zip_opt_len   +3+7)>>3;
-    static_lenb = (zip_static_len+3+7)>>3;
-
-//    Trace((stderr, "\nopt %lu(%lu) stat %lu(%lu) stored %lu lit %u dist %u ",
-//	   opt_lenb, encoder->opt_len,
-//	   static_lenb, encoder->static_len, stored_len,
-//	   encoder->last_lit, encoder->last_dist));
-
-    if(static_lenb <= opt_lenb)
-	opt_lenb = static_lenb;
-    if(stored_len + 4 <= opt_lenb // 4: two words for the lengths
-       && zip_block_start >= 0) {
-	var i;
-
-	/* The test buf != NULL is only necessary if LIT_BUFSIZE > WSIZE.
-	 * Otherwise we can't have processed more than WSIZE input bytes since
-	 * the last block flush, because compression would have been
-	 * successful. If LIT_BUFSIZE <= WSIZE, it is never too late to
-	 * transform a block into a stored block.
-	 */
-	zip_send_bits((zip_STORED_BLOCK<<1)+eof, 3);  /* send block type */
-	zip_bi_windup();		 /* align on byte boundary */
-	zip_put_short(stored_len);
-	zip_put_short(~stored_len);
-
-      // copy block
-/*
-      p = &window[block_start];
-      for(i = 0; i < stored_len; i++)
-	put_byte(p[i]);
-*/
-	for(i = 0; i < stored_len; i++)
-	    zip_put_byte(zip_window[zip_block_start + i]);
-
-    } else if(static_lenb == opt_lenb) {
-	zip_send_bits((zip_STATIC_TREES<<1)+eof, 3);
-	zip_compress_block(zip_static_ltree, zip_static_dtree);
-    } else {
-	zip_send_bits((zip_DYN_TREES<<1)+eof, 3);
-	zip_send_all_trees(zip_l_desc.max_code+1,
-			   zip_d_desc.max_code+1,
-			   max_blindex+1);
-	zip_compress_block(zip_dyn_ltree, zip_dyn_dtree);
-    }
-
-    zip_init_block();
-
-    if(eof != 0)
-	zip_bi_windup();
-}
-
-/* ==========================================================================
- * Save the match info and tally the frequency counts. Return true if
- * the current block must be flushed.
- */
-var zip_ct_tally = function(
-	dist, // distance of matched string
-	lc) { // match length-MIN_MATCH or unmatched char (if dist==0)
-    zip_l_buf[zip_last_lit++] = lc;
-    if(dist == 0) {
-	// lc is the unmatched char
-	zip_dyn_ltree[lc].fc++;
-    } else {
-	// Here, lc is the match length - MIN_MATCH
-	dist--;		    // dist = match distance - 1
-//      Assert((ush)dist < (ush)MAX_DIST &&
-//	     (ush)lc <= (ush)(MAX_MATCH-MIN_MATCH) &&
-//	     (ush)D_CODE(dist) < (ush)D_CODES,  "ct_tally: bad match");
-
-	zip_dyn_ltree[zip_length_code[lc]+zip_LITERALS+1].fc++;
-	zip_dyn_dtree[zip_D_CODE(dist)].fc++;
-
-	zip_d_buf[zip_last_dist++] = dist;
-	zip_flags |= zip_flag_bit;
-    }
-    zip_flag_bit <<= 1;
-
-    // Output the flags if they fill a byte
-    if((zip_last_lit & 7) == 0) {
-	zip_flag_buf[zip_last_flags++] = zip_flags;
-	zip_flags = 0;
-	zip_flag_bit = 1;
-    }
-    // Try to guess if it is profitable to stop the current block here
-    if(zip_compr_level > 2 && (zip_last_lit & 0xfff) == 0) {
-	// Compute an upper bound for the compressed length
-	var out_length = zip_last_lit * 8;
-	var in_length = zip_strstart - zip_block_start;
-	var dcode;
-
-	for(dcode = 0; dcode < zip_D_CODES; dcode++) {
-	    out_length += zip_dyn_dtree[dcode].fc * (5 + zip_extra_dbits[dcode]);
-	}
-	out_length >>= 3;
-//      Trace((stderr,"\nlast_lit %u, last_dist %u, in %ld, out ~%ld(%ld%%) ",
-//	     encoder->last_lit, encoder->last_dist, in_length, out_length,
-//	     100L - out_length*100L/in_length));
-	if(zip_last_dist < parseInt(zip_last_lit/2) &&
-	   out_length < parseInt(in_length/2))
-	    return true;
-    }
-    return (zip_last_lit == zip_LIT_BUFSIZE-1 ||
-	    zip_last_dist == zip_DIST_BUFSIZE);
-    /* We avoid equality with LIT_BUFSIZE because of wraparound at 64K
-     * on 16 bit machines and because stored blocks are restricted to
-     * 64K-1 bytes.
-     */
-}
-
-  /* ==========================================================================
-   * Send the block data compressed using the given Huffman trees
-   */
-var zip_compress_block = function(
-	ltree,	// literal tree
-	dtree) {	// distance tree
-    var dist;		// distance of matched string
-    var lc;		// match length or unmatched char (if dist == 0)
-    var lx = 0;		// running index in l_buf
-    var dx = 0;		// running index in d_buf
-    var fx = 0;		// running index in flag_buf
-    var flag = 0;	// current flags
-    var code;		// the code to send
-    var extra;		// number of extra bits to send
-
-    if(zip_last_lit != 0) do {
-	if((lx & 7) == 0)
-	    flag = zip_flag_buf[fx++];
-	lc = zip_l_buf[lx++] & 0xff;
-	if((flag & 1) == 0) {
-	    zip_SEND_CODE(lc, ltree); /* send a literal byte */
-//	Tracecv(isgraph(lc), (stderr," '%c' ", lc));
-	} else {
-	    // Here, lc is the match length - MIN_MATCH
-	    code = zip_length_code[lc];
-	    zip_SEND_CODE(code+zip_LITERALS+1, ltree); // send the length code
-	    extra = zip_extra_lbits[code];
-	    if(extra != 0) {
-		lc -= zip_base_length[code];
-		zip_send_bits(lc, extra); // send the extra length bits
-	    }
-	    dist = zip_d_buf[dx++];
-	    // Here, dist is the match distance - 1
-	    code = zip_D_CODE(dist);
-//	Assert (code < D_CODES, "bad d_code");
-
-	    zip_SEND_CODE(code, dtree);	  // send the distance code
-	    extra = zip_extra_dbits[code];
-	    if(extra != 0) {
-		dist -= zip_base_dist[code];
-		zip_send_bits(dist, extra);   // send the extra distance bits
-	    }
-	} // literal or match pair ?
-	flag >>= 1;
-    } while(lx < zip_last_lit);
-
-    zip_SEND_CODE(zip_END_BLOCK, ltree);
-}
-
-/* ==========================================================================
- * Send a value on a given number of bits.
- * IN assertion: length <= 16 and value fits in length bits.
- */
-var zip_Buf_size = 16; // bit size of bi_buf
-var zip_send_bits = function(
-	value,	// value to send
-	length) {	// number of bits
-    /* If not enough room in bi_buf, use (valid) bits from bi_buf and
-     * (16 - bi_valid) bits from value, leaving (width - (16-bi_valid))
-     * unused bits in value.
-     */
-    if(zip_bi_valid > zip_Buf_size - length) {
-	zip_bi_buf |= (value << zip_bi_valid);
-	zip_put_short(zip_bi_buf);
-	zip_bi_buf = (value >> (zip_Buf_size - zip_bi_valid));
-	zip_bi_valid += length - zip_Buf_size;
-    } else {
-	zip_bi_buf |= value << zip_bi_valid;
-	zip_bi_valid += length;
-    }
-}
-
-/* ==========================================================================
- * Reverse the first len bits of a code, using straightforward code (a faster
- * method would use a table)
- * IN assertion: 1 <= len <= 15
- */
-var zip_bi_reverse = function(
-	code,	// the value to invert
-	len) {	// its bit length
-    var res = 0;
-    do {
-	res |= code & 1;
-	code >>= 1;
-	res <<= 1;
-    } while(--len > 0);
-    return res >> 1;
-}
-
-/* ==========================================================================
- * Write out any remaining bits in an incomplete byte.
- */
-var zip_bi_windup = function() {
-    if(zip_bi_valid > 8) {
-	zip_put_short(zip_bi_buf);
-    } else if(zip_bi_valid > 0) {
-	zip_put_byte(zip_bi_buf);
-    }
-    zip_bi_buf = 0;
-    zip_bi_valid = 0;
-}
-
-var zip_qoutbuf = function() {
-    if(zip_outcnt != 0) {
-	var q, i;
-	q = zip_new_queue();
-	if(zip_qhead == null)
-	    zip_qhead = zip_qtail = q;
-	else
-	    zip_qtail = zip_qtail.next = q;
-	q.len = zip_outcnt - zip_outoff;
-//      System.arraycopy(zip_outbuf, zip_outoff, q.ptr, 0, q.len);
-	for(i = 0; i < q.len; i++)
-	    q.ptr[i] = zip_outbuf[zip_outoff + i];
-	zip_outcnt = zip_outoff = 0;
-    }
-}
-
-var zip_deflate = function(str, level) {
-    var i, j;
-
-    zip_deflate_data = str;
-    zip_deflate_pos = 0;
-    if(typeof level == "undefined")
-	level = zip_DEFAULT_LEVEL;
-    zip_deflate_start(level);
-
-    var buff = new Array(1024);
-    var aout = [];
-    while((i = zip_deflate_internal(buff, 0, buff.length)) > 0) {
-	var cbuf = new Array(i);
-	for(j = 0; j < i; j++){
-	    cbuf[j] = String.fromCharCode(buff[j]);
-	}
-	aout[aout.length] = cbuf.join("");
-    }
-    zip_deflate_data = null; // G.C.
-    return aout.join("");
-}
-
-//
-// end of the script of Masanao Izumo.
-//
-
-// we add the compression method for JSZip
-if(!JSZip.compressions["DEFLATE"]) {
-  JSZip.compressions["DEFLATE"] = {
-    magic : "\x08\x00",
-    compress : zip_deflate
-  }
-} else {
-  JSZip.compressions["DEFLATE"].compress = zip_deflate;
-}
-
-})();
-
-// enforcing Stuk's coding style
-// vim: set shiftwidth=3 softtabstop=3:
-/*
- * Port of a script by Masanao Izumo.
- *
- * Only changes : wrap all the variables in a function and add the 
- * main function to JSZip (DEFLATE compression method).
- * Everything else was written by M. Izumo.
- *
- * Original code can be found here: http://www.onicos.com/staff/iz/amuse/javascript/expert/inflate.txt
- */
-
-if(!JSZip) {
-   throw "JSZip not defined";
-}
-
-/*
- * Original:
- *   http://www.onicos.com/staff/iz/amuse/javascript/expert/inflate.txt
- */
-
-(function(){
-  // the original implementation leaks a global variable.
-  // Defining the variable here doesn't break anything.
-  var zip_fixed_bd;
-
-/* Copyright (C) 1999 Masanao Izumo <iz@onicos.co.jp>
- * Version: 1.0.0.1
- * LastModified: Dec 25 1999
- */
-
-/* Interface:
- * data = zip_inflate(src);
- */
-
-/* constant parameters */
-var zip_WSIZE = 32768;		// Sliding Window size
-var zip_STORED_BLOCK = 0;
-var zip_STATIC_TREES = 1;
-var zip_DYN_TREES    = 2;
-
-/* for inflate */
-var zip_lbits = 9; 		// bits in base literal/length lookup table
-var zip_dbits = 6; 		// bits in base distance lookup table
-var zip_INBUFSIZ = 32768;	// Input buffer size
-var zip_INBUF_EXTRA = 64;	// Extra buffer
-
-/* variables (inflate) */
-var zip_slide;
-var zip_wp;			// current position in slide
-var zip_fixed_tl = null;	// inflate static
-var zip_fixed_td;		// inflate static
-var zip_fixed_bl, fixed_bd;	// inflate static
-var zip_bit_buf;		// bit buffer
-var zip_bit_len;		// bits in bit buffer
-var zip_method;
-var zip_eof;
-var zip_copy_leng;
-var zip_copy_dist;
-var zip_tl, zip_td;	// literal/length and distance decoder tables
-var zip_bl, zip_bd;	// number of bits decoded by tl and td
-
-var zip_inflate_data;
-var zip_inflate_pos;
-
-
-/* constant tables (inflate) */
-var zip_MASK_BITS = new Array(
-    0x0000,
-    0x0001, 0x0003, 0x0007, 0x000f, 0x001f, 0x003f, 0x007f, 0x00ff,
-    0x01ff, 0x03ff, 0x07ff, 0x0fff, 0x1fff, 0x3fff, 0x7fff, 0xffff);
-// Tables for deflate from PKZIP's appnote.txt.
-var zip_cplens = new Array( // Copy lengths for literal codes 257..285
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
-    35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258, 0, 0);
-/* note: see note #13 above about the 258 in this list. */
-var zip_cplext = new Array( // Extra bits for literal codes 257..285
-    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
-    3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0, 99, 99); // 99==invalid
-var zip_cpdist = new Array( // Copy offsets for distance codes 0..29
-    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
-    257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
-    8193, 12289, 16385, 24577);
-var zip_cpdext = new Array( // Extra bits for distance codes
-    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
-    7, 7, 8, 8, 9, 9, 10, 10, 11, 11,
-    12, 12, 13, 13);
-var zip_border = new Array(  // Order of the bit length code lengths
-    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15);
-/* objects (inflate) */
-
-function zip_HuftList() {
-    this.next = null;
-    this.list = null;
-}
-
-function zip_HuftNode() {
-    this.e = 0; // number of extra bits or operation
-    this.b = 0; // number of bits in this code or subcode
-
-    // union
-    this.n = 0; // literal, length base, or distance base
-    this.t = null; // (zip_HuftNode) pointer to next level of table
-}
-
-function zip_HuftBuild(b,	// code lengths in bits (all assumed <= BMAX)
-		       n,	// number of codes (assumed <= N_MAX)
-		       s,	// number of simple-valued codes (0..s-1)
-		       d,	// list of base values for non-simple codes
-		       e,	// list of extra bits for non-simple codes
-		       mm	// maximum lookup bits
-		   ) {
-    this.BMAX = 16;   // maximum bit length of any code
-    this.N_MAX = 288; // maximum number of codes in any set
-    this.status = 0;	// 0: success, 1: incomplete table, 2: bad input
-    this.root = null;	// (zip_HuftList) starting table
-    this.m = 0;		// maximum lookup bits, returns actual
-
-/* Given a list of code lengths and a maximum table size, make a set of
-   tables to decode that set of codes.	Return zero on success, one if
-   the given code set is incomplete (the tables are still built in this
-   case), two if the input is invalid (all zero length codes or an
-   oversubscribed set of lengths), and three if not enough memory.
-   The code with value 256 is special, and the tables are constructed
-   so that no bits beyond that code are fetched when that code is
-   decoded. */
-    {
-	var a;			// counter for codes of length k
-	var c = new Array(this.BMAX+1);	// bit length count table
-	var el;			// length of EOB code (value 256)
-	var f;			// i repeats in table every f entries
-	var g;			// maximum code length
-	var h;			// table level
-	var i;			// counter, current code
-	var j;			// counter
-	var k;			// number of bits in current code
-	var lx = new Array(this.BMAX+1);	// stack of bits per table
-	var p;			// pointer into c[], b[], or v[]
-	var pidx;		// index of p
-	var q;			// (zip_HuftNode) points to current table
-	var r = new zip_HuftNode(); // table entry for structure assignment
-	var u = new Array(this.BMAX); // zip_HuftNode[BMAX][]  table stack
-	var v = new Array(this.N_MAX); // values in order of bit length
-	var w;
-	var x = new Array(this.BMAX+1);// bit offsets, then code stack
-	var xp;			// pointer into x or c
-	var y;			// number of dummy codes added
-	var z;			// number of entries in current table
-	var o;
-	var tail;		// (zip_HuftList)
-
-	tail = this.root = null;
-	for(i = 0; i < c.length; i++)
-	    c[i] = 0;
-	for(i = 0; i < lx.length; i++)
-	    lx[i] = 0;
-	for(i = 0; i < u.length; i++)
-	    u[i] = null;
-	for(i = 0; i < v.length; i++)
-	    v[i] = 0;
-	for(i = 0; i < x.length; i++)
-	    x[i] = 0;
-
-	// Generate counts for each bit length
-	el = n > 256 ? b[256] : this.BMAX; // set length of EOB code, if any
-	p = b; pidx = 0;
-	i = n;
-	do {
-	    c[p[pidx]]++;	// assume all entries <= BMAX
-	    pidx++;
-	} while(--i > 0);
-	if(c[0] == n) {	// null input--all zero length codes
-	    this.root = null;
-	    this.m = 0;
-	    this.status = 0;
-	    return;
-	}
-
-	// Find minimum and maximum length, bound *m by those
-	for(j = 1; j <= this.BMAX; j++)
-	    if(c[j] != 0)
-		break;
-	k = j;			// minimum code length
-	if(mm < j)
-	    mm = j;
-	for(i = this.BMAX; i != 0; i--)
-	    if(c[i] != 0)
-		break;
-	g = i;			// maximum code length
-	if(mm > i)
-	    mm = i;
-
-	// Adjust last length count to fill out codes, if needed
-	for(y = 1 << j; j < i; j++, y <<= 1)
-	    if((y -= c[j]) < 0) {
-		this.status = 2;	// bad input: more codes than bits
-		this.m = mm;
-		return;
-	    }
-	if((y -= c[i]) < 0) {
-	    this.status = 2;
-	    this.m = mm;
-	    return;
-	}
-	c[i] += y;
-
-	// Generate starting offsets into the value table for each length
-	x[1] = j = 0;
-	p = c;
-	pidx = 1;
-	xp = 2;
-	while(--i > 0)		// note that i == g from above
-	    x[xp++] = (j += p[pidx++]);
-
-	// Make a table of values in order of bit lengths
-	p = b; pidx = 0;
-	i = 0;
-	do {
-	    if((j = p[pidx++]) != 0)
-		v[x[j]++] = i;
-	} while(++i < n);
-	n = x[g];			// set n to length of v
-
-	// Generate the Huffman codes and for each, make the table entries
-	x[0] = i = 0;		// first Huffman code is zero
-	p = v; pidx = 0;		// grab values in bit order
-	h = -1;			// no tables yet--level -1
-	w = lx[0] = 0;		// no bits decoded yet
-	q = null;			// ditto
-	z = 0;			// ditto
-
-	// go through the bit lengths (k already is bits in shortest code)
-	for(; k <= g; k++) {
-	    a = c[k];
-	    while(a-- > 0) {
-		// here i is the Huffman code of length k bits for value p[pidx]
-		// make tables up to required level
-		while(k > w + lx[1 + h]) {
-		    w += lx[1 + h]; // add bits already decoded
-		    h++;
-
-		    // compute minimum size table less than or equal to *m bits
-		    z = (z = g - w) > mm ? mm : z; // upper limit
-		    if((f = 1 << (j = k - w)) > a + 1) { // try a k-w bit table
-			// too few codes for k-w bit table
-			f -= a + 1;	// deduct codes from patterns left
-			xp = k;
-			while(++j < z) { // try smaller tables up to z bits
-			    if((f <<= 1) <= c[++xp])
-				break;	// enough codes to use up j bits
-			    f -= c[xp];	// else deduct codes from patterns
-			}
-		    }
-		    if(w + j > el && w < el)
-			j = el - w;	// make EOB code end at table
-		    z = 1 << j;	// table entries for j-bit table
-		    lx[1 + h] = j; // set table size in stack
-
-		    // allocate and link in new table
-		    q = new Array(z);
-		    for(o = 0; o < z; o++) {
-			q[o] = new zip_HuftNode();
-		    }
-
-		    if(tail == null)
-			tail = this.root = new zip_HuftList();
-		    else
-			tail = tail.next = new zip_HuftList();
-		    tail.next = null;
-		    tail.list = q;
-		    u[h] = q;	// table starts after link
-
-		    /* connect to last table, if there is one */
-		    if(h > 0) {
-			x[h] = i;		// save pattern for backing up
-			r.b = lx[h];	// bits to dump before this table
-			r.e = 16 + j;	// bits in this table
-			r.t = q;		// pointer to this table
-			j = (i & ((1 << w) - 1)) >> (w - lx[h]);
-			u[h-1][j].e = r.e;
-			u[h-1][j].b = r.b;
-			u[h-1][j].n = r.n;
-			u[h-1][j].t = r.t;
-		    }
-		}
-
-		// set up table entry in r
-		r.b = k - w;
-		if(pidx >= n)
-		    r.e = 99;		// out of values--invalid code
-		else if(p[pidx] < s) {
-		    r.e = (p[pidx] < 256 ? 16 : 15); // 256 is end-of-block code
-		    r.n = p[pidx++];	// simple code is just the value
-		} else {
-		    r.e = e[p[pidx] - s];	// non-simple--look up in lists
-		    r.n = d[p[pidx++] - s];
-		}
-
-		// fill code-like entries with r //
-		f = 1 << (k - w);
-		for(j = i >> w; j < z; j += f) {
-		    q[j].e = r.e;
-		    q[j].b = r.b;
-		    q[j].n = r.n;
-		    q[j].t = r.t;
-		}
-
-		// backwards increment the k-bit code i
-		for(j = 1 << (k - 1); (i & j) != 0; j >>= 1)
-		    i ^= j;
-		i ^= j;
-
-		// backup over finished tables
-		while((i & ((1 << w) - 1)) != x[h]) {
-		    w -= lx[h];		// don't need to update q
-		    h--;
-		}
-	    }
-	}
-
-	/* return actual size of base table */
-	this.m = lx[1];
-
-	/* Return true (1) if we were given an incomplete table */
-	this.status = ((y != 0 && g != 1) ? 1 : 0);
-    } /* end of constructor */
-}
-
-
-/* routines (inflate) */
-
-function zip_GET_BYTE() {
-    if(zip_inflate_data.length == zip_inflate_pos)
-	return -1;
-    return zip_inflate_data.charCodeAt(zip_inflate_pos++) & 0xff;
-}
-
-function zip_NEEDBITS(n) {
-    while(zip_bit_len < n) {
-	zip_bit_buf |= zip_GET_BYTE() << zip_bit_len;
-	zip_bit_len += 8;
-    }
-}
-
-function zip_GETBITS(n) {
-    return zip_bit_buf & zip_MASK_BITS[n];
-}
-
-function zip_DUMPBITS(n) {
-    zip_bit_buf >>= n;
-    zip_bit_len -= n;
-}
-
-function zip_inflate_codes(buff, off, size) {
-    /* inflate (decompress) the codes in a deflated (compressed) block.
-       Return an error code or zero if it all goes ok. */
-    var e;		// table entry flag/number of extra bits
-    var t;		// (zip_HuftNode) pointer to table entry
-    var n;
-
-    if(size == 0)
-      return 0;
-
-    // inflate the coded data
-    n = 0;
-    for(;;) {			// do until end of block
-	zip_NEEDBITS(zip_bl);
-	t = zip_tl.list[zip_GETBITS(zip_bl)];
-	e = t.e;
-	while(e > 16) {
-	    if(e == 99)
-		return -1;
-	    zip_DUMPBITS(t.b);
-	    e -= 16;
-	    zip_NEEDBITS(e);
-	    t = t.t[zip_GETBITS(e)];
-	    e = t.e;
-	}
-	zip_DUMPBITS(t.b);
-
-	if(e == 16) {		// then it's a literal
-	    zip_wp &= zip_WSIZE - 1;
-	    buff[off + n++] = zip_slide[zip_wp++] = t.n;
-	    if(n == size)
-		return size;
-	    continue;
-	}
-
-	// exit if end of block
-	if(e == 15)
-	    break;
-
-	// it's an EOB or a length
-
-	// get length of block to copy
-	zip_NEEDBITS(e);
-	zip_copy_leng = t.n + zip_GETBITS(e);
-	zip_DUMPBITS(e);
-
-	// decode distance of block to copy
-	zip_NEEDBITS(zip_bd);
-	t = zip_td.list[zip_GETBITS(zip_bd)];
-	e = t.e;
-
-	while(e > 16) {
-	    if(e == 99)
-		return -1;
-	    zip_DUMPBITS(t.b);
-	    e -= 16;
-	    zip_NEEDBITS(e);
-	    t = t.t[zip_GETBITS(e)];
-	    e = t.e;
-	}
-	zip_DUMPBITS(t.b);
-	zip_NEEDBITS(e);
-	zip_copy_dist = zip_wp - t.n - zip_GETBITS(e);
-	zip_DUMPBITS(e);
-
-	// do the copy
-	while(zip_copy_leng > 0 && n < size) {
-	    zip_copy_leng--;
-	    zip_copy_dist &= zip_WSIZE - 1;
-	    zip_wp &= zip_WSIZE - 1;
-	    buff[off + n++] = zip_slide[zip_wp++]
-		= zip_slide[zip_copy_dist++];
-	}
-
-	if(n == size)
-	    return size;
-    }
-
-    zip_method = -1; // done
-    return n;
-}
-
-function zip_inflate_stored(buff, off, size) {
-    /* "decompress" an inflated type 0 (stored) block. */
-    var n;
-
-    // go to byte boundary
-    n = zip_bit_len & 7;
-    zip_DUMPBITS(n);
-
-    // get the length and its complement
-    zip_NEEDBITS(16);
-    n = zip_GETBITS(16);
-    zip_DUMPBITS(16);
-    zip_NEEDBITS(16);
-    if(n != ((~zip_bit_buf) & 0xffff))
-	return -1;			// error in compressed data
-    zip_DUMPBITS(16);
-
-    // read and output the compressed data
-    zip_copy_leng = n;
-
-    n = 0;
-    while(zip_copy_leng > 0 && n < size) {
-	zip_copy_leng--;
-	zip_wp &= zip_WSIZE - 1;
-	zip_NEEDBITS(8);
-	buff[off + n++] = zip_slide[zip_wp++] =
-	    zip_GETBITS(8);
-	zip_DUMPBITS(8);
-    }
-
-    if(zip_copy_leng == 0)
-      zip_method = -1; // done
-    return n;
-}
-
-function zip_inflate_fixed(buff, off, size) {
-    /* decompress an inflated type 1 (fixed Huffman codes) block.  We should
-       either replace this with a custom decoder, or at least precompute the
-       Huffman tables. */
-
-    // if first time, set up tables for fixed blocks
-    if(zip_fixed_tl == null) {
-	var i;			// temporary variable
-	var l = new Array(288);	// length list for huft_build
-	var h;	// zip_HuftBuild
-
-	// literal table
-	for(i = 0; i < 144; i++)
-	    l[i] = 8;
-	for(; i < 256; i++)
-	    l[i] = 9;
-	for(; i < 280; i++)
-	    l[i] = 7;
-	for(; i < 288; i++)	// make a complete, but wrong code set
-	    l[i] = 8;
-	zip_fixed_bl = 7;
-
-	h = new zip_HuftBuild(l, 288, 257, zip_cplens, zip_cplext,
-			      zip_fixed_bl);
-	if(h.status != 0) {
-	    alert("HufBuild error: "+h.status);
-	    return -1;
-	}
-	zip_fixed_tl = h.root;
-	zip_fixed_bl = h.m;
-
-	// distance table
-	for(i = 0; i < 30; i++)	// make an incomplete code set
-	    l[i] = 5;
-	zip_fixed_bd = 5;
-
-	h = new zip_HuftBuild(l, 30, 0, zip_cpdist, zip_cpdext, zip_fixed_bd);
-	if(h.status > 1) {
-	    zip_fixed_tl = null;
-	    alert("HufBuild error: "+h.status);
-	    return -1;
-	}
-	zip_fixed_td = h.root;
-	zip_fixed_bd = h.m;
-    }
-
-    zip_tl = zip_fixed_tl;
-    zip_td = zip_fixed_td;
-    zip_bl = zip_fixed_bl;
-    zip_bd = zip_fixed_bd;
-    return zip_inflate_codes(buff, off, size);
-}
-
-function zip_inflate_dynamic(buff, off, size) {
-    // decompress an inflated type 2 (dynamic Huffman codes) block.
-    var i;		// temporary variables
-    var j;
-    var l;		// last length
-    var n;		// number of lengths to get
-    var t;		// (zip_HuftNode) literal/length code table
-    var nb;		// number of bit length codes
-    var nl;		// number of literal/length codes
-    var nd;		// number of distance codes
-    var ll = new Array(286+30); // literal/length and distance code lengths
-    var h;		// (zip_HuftBuild)
-
-    for(i = 0; i < ll.length; i++)
-	ll[i] = 0;
-
-    // read in table lengths
-    zip_NEEDBITS(5);
-    nl = 257 + zip_GETBITS(5);	// number of literal/length codes
-    zip_DUMPBITS(5);
-    zip_NEEDBITS(5);
-    nd = 1 + zip_GETBITS(5);	// number of distance codes
-    zip_DUMPBITS(5);
-    zip_NEEDBITS(4);
-    nb = 4 + zip_GETBITS(4);	// number of bit length codes
-    zip_DUMPBITS(4);
-    if(nl > 286 || nd > 30)
-      return -1;		// bad lengths
-
-    // read in bit-length-code lengths
-    for(j = 0; j < nb; j++)
-    {
-	zip_NEEDBITS(3);
-	ll[zip_border[j]] = zip_GETBITS(3);
-	zip_DUMPBITS(3);
-    }
-    for(; j < 19; j++)
-	ll[zip_border[j]] = 0;
-
-    // build decoding table for trees--single level, 7 bit lookup
-    zip_bl = 7;
-    h = new zip_HuftBuild(ll, 19, 19, null, null, zip_bl);
-    if(h.status != 0)
-	return -1;	// incomplete code set
-
-    zip_tl = h.root;
-    zip_bl = h.m;
-
-    // read in literal and distance code lengths
-    n = nl + nd;
-    i = l = 0;
-    while(i < n) {
-	zip_NEEDBITS(zip_bl);
-	t = zip_tl.list[zip_GETBITS(zip_bl)];
-	j = t.b;
-	zip_DUMPBITS(j);
-	j = t.n;
-	if(j < 16)		// length of code in bits (0..15)
-	    ll[i++] = l = j;	// save last length in l
-	else if(j == 16) {	// repeat last length 3 to 6 times
-	    zip_NEEDBITS(2);
-	    j = 3 + zip_GETBITS(2);
-	    zip_DUMPBITS(2);
-	    if(i + j > n)
-		return -1;
-	    while(j-- > 0)
-		ll[i++] = l;
-	} else if(j == 17) {	// 3 to 10 zero length codes
-	    zip_NEEDBITS(3);
-	    j = 3 + zip_GETBITS(3);
-	    zip_DUMPBITS(3);
-	    if(i + j > n)
-		return -1;
-	    while(j-- > 0)
-		ll[i++] = 0;
-	    l = 0;
-	} else {		// j == 18: 11 to 138 zero length codes
-	    zip_NEEDBITS(7);
-	    j = 11 + zip_GETBITS(7);
-	    zip_DUMPBITS(7);
-	    if(i + j > n)
-		return -1;
-	    while(j-- > 0)
-		ll[i++] = 0;
-	    l = 0;
-	}
-    }
-
-    // build the decoding tables for literal/length and distance codes
-    zip_bl = zip_lbits;
-    h = new zip_HuftBuild(ll, nl, 257, zip_cplens, zip_cplext, zip_bl);
-    if(zip_bl == 0)	// no literals or lengths
-	h.status = 1;
-    if(h.status != 0) {
-	if(h.status == 1)
-	    ;// **incomplete literal tree**
-	return -1;		// incomplete code set
-    }
-    zip_tl = h.root;
-    zip_bl = h.m;
-
-    for(i = 0; i < nd; i++)
-	ll[i] = ll[i + nl];
-    zip_bd = zip_dbits;
-    h = new zip_HuftBuild(ll, nd, 0, zip_cpdist, zip_cpdext, zip_bd);
-    zip_td = h.root;
-    zip_bd = h.m;
-
-    if(zip_bd == 0 && nl > 257) {   // lengths but no distances
-	// **incomplete distance tree**
-	return -1;
-    }
-
-    if(h.status == 1) {
-	;// **incomplete distance tree**
-    }
-    if(h.status != 0)
-	return -1;
-
-    // decompress until an end-of-block code
-    return zip_inflate_codes(buff, off, size);
-}
-
-function zip_inflate_start() {
-    var i;
-
-    if(zip_slide == null)
-	zip_slide = new Array(2 * zip_WSIZE);
-    zip_wp = 0;
-    zip_bit_buf = 0;
-    zip_bit_len = 0;
-    zip_method = -1;
-    zip_eof = false;
-    zip_copy_leng = zip_copy_dist = 0;
-    zip_tl = null;
-}
-
-function zip_inflate_internal(buff, off, size) {
-    // decompress an inflated entry
-    var n, i;
-
-    n = 0;
-    while(n < size) {
-	if(zip_eof && zip_method == -1)
-	    return n;
-
-	if(zip_copy_leng > 0) {
-	    if(zip_method != zip_STORED_BLOCK) {
-		// STATIC_TREES or DYN_TREES
-		while(zip_copy_leng > 0 && n < size) {
-		    zip_copy_leng--;
-		    zip_copy_dist &= zip_WSIZE - 1;
-		    zip_wp &= zip_WSIZE - 1;
-		    buff[off + n++] = zip_slide[zip_wp++] =
-			zip_slide[zip_copy_dist++];
-		}
-	    } else {
-		while(zip_copy_leng > 0 && n < size) {
-		    zip_copy_leng--;
-		    zip_wp &= zip_WSIZE - 1;
-		    zip_NEEDBITS(8);
-		    buff[off + n++] = zip_slide[zip_wp++] = zip_GETBITS(8);
-		    zip_DUMPBITS(8);
-		}
-		if(zip_copy_leng == 0)
-		    zip_method = -1; // done
-	    }
-	    if(n == size)
-		return n;
-	}
-
-	if(zip_method == -1) {
-	    if(zip_eof)
-		break;
-
-	    // read in last block bit
-	    zip_NEEDBITS(1);
-	    if(zip_GETBITS(1) != 0)
-		zip_eof = true;
-	    zip_DUMPBITS(1);
-
-	    // read in block type
-	    zip_NEEDBITS(2);
-	    zip_method = zip_GETBITS(2);
-	    zip_DUMPBITS(2);
-	    zip_tl = null;
-	    zip_copy_leng = 0;
-	}
-
-	switch(zip_method) {
-	  case 0: // zip_STORED_BLOCK
-	    i = zip_inflate_stored(buff, off + n, size - n);
-	    break;
-
-	  case 1: // zip_STATIC_TREES
-	    if(zip_tl != null)
-		i = zip_inflate_codes(buff, off + n, size - n);
-	    else
-		i = zip_inflate_fixed(buff, off + n, size - n);
-	    break;
-
-	  case 2: // zip_DYN_TREES
-	    if(zip_tl != null)
-		i = zip_inflate_codes(buff, off + n, size - n);
-	    else
-		i = zip_inflate_dynamic(buff, off + n, size - n);
-	    break;
-
-	  default: // error
-	    i = -1;
-	    break;
-	}
-
-	if(i == -1) {
-	    if(zip_eof)
-		return 0;
-	    return -1;
-	}
-	n += i;
-    }
-    return n;
-}
-
-function zip_inflate(str) {
-    var out, buff;
-    var i, j;
-
-    zip_inflate_start();
-    zip_inflate_data = str;
-    zip_inflate_pos = 0;
-
-    buff = new Array(1024);
-    out = "";
-    while((i = zip_inflate_internal(buff, 0, buff.length)) > 0) {
-	for(j = 0; j < i; j++)
-	    out += String.fromCharCode(buff[j]);
-    }
-    zip_inflate_data = null; // G.C.
-    return out;
-}
-
-//
-// end of the script of Masanao Izumo.
-//
-
-// we add the compression method for JSZip
-if(!JSZip.compressions["DEFLATE"]) {
-  JSZip.compressions["DEFLATE"] = {
-    magic : "\x08\x00",
-    uncompress : zip_inflate
-  }
-} else {
-  JSZip.compressions["DEFLATE"].uncompress = zip_inflate;
-}
-
-})();
-
-// enforcing Stuk's coding style
-// vim: set shiftwidth=3 softtabstop=3:
-/**
-
-JSZip - A Javascript class for generating and reading zip files
-<http://stuartk.com/jszip>
-
-(c) 2011 David Duponchel <d.duponchel@gmail.com>
-Dual licenced under the MIT license or GPLv3. See LICENSE.markdown.
-
-**/
-/*global JSZip,JSZipBase64 */
-(function () {
-
-   var MAX_VALUE_16BITS = 65535;
-   var MAX_VALUE_32BITS = -1; // well, "\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF" is parsed as -1
-
-   /**
-    * Prettify a string read as binary.
-    * @param {string} str the string to prettify.
-    * @return {string} a pretty string.
-    */
-   var pretty = function (str) {
-      var res = '', code, i;
-      for (i = 0; i < (str||"").length; i++) {
-         code = str.charCodeAt(i);
-         res += '\\x' + (code < 16 ? "0" : "") + code.toString(16).toUpperCase();
-      }
-      return res;
-   };
-
-   /**
-    * Find a compression registered in JSZip.
-    * @param {string} compressionMethod the method magic to find.
-    * @return {Object|null} the JSZip compression object, null if none found.
-    */
-   var findCompression = function (compressionMethod) {
-      for (var method in JSZip.compressions) {
-         if( !JSZip.compressions.hasOwnProperty(method) ) { continue; }
-         if (JSZip.compressions[method].magic === compressionMethod) {
-            return JSZip.compressions[method];
-         }
-      }
-      return null;
-   };
-
-   // class StreamReader {{{
-   /**
-    * Read bytes from a stream.
-    * Developer tip : when debugging, a watch on pretty(this.reader.stream.slice(this.reader.index))
-    * is very useful :)
-    * @constructor
-    * @param {String|ArrayBuffer|Uint8Array} stream the stream to read.
-    */
-   function StreamReader(stream) {
-      this.stream = "";
-      if (JSZip.support.uint8array && stream instanceof Uint8Array) {
-         this.stream = JSZip.utils.uint8Array2String(stream);
-      } else if (JSZip.support.arraybuffer && stream instanceof ArrayBuffer) {
-         var bufferView = new Uint8Array(stream);
-         this.stream = JSZip.utils.uint8Array2String(bufferView);
-      } else {
-         this.stream = JSZip.utils.string2binary(stream);
-      }
-      this.index = 0;
-   }
-   StreamReader.prototype = {
-      /**
-       * Check that the offset will not go too far.
-       * @param {string} offset the additional offset to check.
-       * @throws {Error} an Error if the offset is out of bounds.
-       */
-      checkOffset : function (offset) {
-         this.checkIndex(this.index + offset);
-      },
-      /**
-       * Check that the specifed index will not be too far.
-       * @param {string} newIndex the index to check.
-       * @throws {Error} an Error if the index is out of bounds.
-       */
-      checkIndex : function (newIndex) {
-         if (this.stream.length < newIndex || newIndex < 0) {
-            throw new Error("End of stream reached (stream length = " +
-                            this.stream.length + ", asked index = " +
-                            (newIndex) + "). Corrupted zip ?");
-         }
-      },
-      /**
-       * Change the index.
-       * @param {number} newIndex The new index.
-       * @throws {Error} if the new index is out of the stream.
-       */
-      setIndex : function (newIndex) {
-         this.checkIndex(newIndex);
-         this.index = newIndex;
-      },
-      /**
-       * Skip the next n bytes.
-       * @param {number} n the number of bytes to skip.
-       * @throws {Error} if the new index is out of the stream.
-       */
-      skip : function (n) {
-         this.setIndex(this.index + n);
-      },
-      /**
-       * Get the byte at the specified index.
-       * @param {number} i the index to use.
-       * @return {number} a byte.
-       */
-      byteAt : function(i) {
-         return this.stream.charCodeAt(i);
-      },
-      /**
-       * Get the next number with a given byte size.
-       * @param {number} size the number of bytes to read.
-       * @return {number} the corresponding number.
-       */
-      readInt : function (size) {
-         var result = 0, i;
-         this.checkOffset(size);
-         for(i = this.index + size - 1; i >= this.index; i--) {
-            result = (result << 8) + this.byteAt(i);
-         }
-         this.index += size;
-         return result;
-      },
-      /**
-       * Get the next string with a given byte size.
-       * @param {number} size the number of bytes to read.
-       * @return {string} the corresponding string.
-       */
-      readString : function (size) {
-         this.checkOffset(size);
-         // this will work because the constructor applied the "& 0xff" mask.
-         var result = this.stream.slice(this.index, this.index + size);
-         this.index += size;
-         return result;
-      },
-      /**
-       * Get the next date.
-       * @return {Date} the date.
-       */
-      readDate : function () {
-         var dostime = this.readInt(4);
-         return new Date(
-            ((dostime >> 25) & 0x7f) + 1980, // year
-            ((dostime >> 21) & 0x0f) - 1, // month
-            (dostime >> 16) & 0x1f, // day
-            (dostime >> 11) & 0x1f, // hour
-            (dostime >> 5) & 0x3f, // minute
-            (dostime & 0x1f) << 1); // second
-      }
-   };
-   // }}} end of StreamReader
-
-   // class ZipEntry {{{
-   /**
-    * An entry in the zip file.
-    * @constructor
-    * @param {Object} options Options of the current file.
-    * @param {Object} loadOptions Options for loading the stream.
-    */
-   function ZipEntry(options, loadOptions) {
-      this.options = options;
-      this.loadOptions = loadOptions;
-   }
-   ZipEntry.prototype = {
-      /**
-       * say if the file is encrypted.
-       * @return {boolean} true if the file is encrypted, false otherwise.
-       */
-      isEncrypted : function () {
-         // bit 1 is set
-         return (this.bitFlag & 0x0001) === 0x0001;
-      },
-      /**
-       * say if the file has utf-8 filename/comment.
-       * @return {boolean} true if the filename/comment is in utf-8, false otherwise.
-       */
-      useUTF8 : function () {
-         // bit 11 is set
-         return (this.bitFlag & 0x0800) === 0x0800;
-      },
-      /**
-       * Read the local part of a zip file and add the info in this object.
-       * @param {StreamReader} reader the reader to use.
-       */
-      readLocalPart : function(reader) {
-         var compression, localExtraFieldsLength;
-
-         // we already know everything from the central dir !
-         // If the central dir data are false, we are doomed.
-         // On the bright side, the local part is scary  : zip64, data descriptors, both, etc.
-         // The less data we get here, the more reliable this should be.
-         // Let's skip the whole header and dash to the data !
-         reader.skip(22);
-         // in some zip created on windows, the filename stored in the central dir contains \ instead of /.
-         // Strangely, the filename here is OK.
-         // I would love to treat these zip files as corrupted (see http://www.info-zip.org/FAQ.html#backslashes
-         // or APPNOTE#4.4.17.1, "All slashes MUST be forward slashes '/'") but there are a lot of bad zip generators...
-         // Search "unzip mismatching "local" filename continuing with "central" filename version" on
-         // the internet.
-         //
-         // I think I see the logic here : the central directory is used to display
-         // content and the local directory is used to extract the files. Mixing / and \
-         // may be used to display \ to windows users and use / when extracting the files.
-         // Unfortunately, this lead also to some issues : http://seclists.org/fulldisclosure/2009/Sep/394
-         this.fileNameLength = reader.readInt(2);
-         localExtraFieldsLength = reader.readInt(2); // can't be sure this will be the same as the central dir
-         this.fileName = reader.readString(this.fileNameLength);
-         reader.skip(localExtraFieldsLength);
-
-         if (this.compressedSize == -1 || this.uncompressedSize == -1) {
-            throw new Error("Bug or corrupted zip : didn't get enough informations from the central directory " +
-                            "(compressedSize == -1 || uncompressedSize == -1)");
-         }
-         this.compressedFileData = reader.readString(this.compressedSize);
-
-         compression = findCompression(this.compressionMethod);
-         if (compression === null) { // no compression found
-            throw new Error("Corrupted zip : compression " + pretty(this.compressionMethod) +
-                            " unknown (inner file : " + this.fileName + ")");
-         }
-         this.uncompressedFileData = compression.uncompress(this.compressedFileData);
-
-         if (this.uncompressedFileData.length !== this.uncompressedSize) {
-            throw new Error("Bug : uncompressed data size mismatch");
-         }
-
-         if (this.loadOptions.checkCRC32 && JSZip.prototype.crc32(this.uncompressedFileData) !== this.crc32) {
-            throw new Error("Corrupted zip : CRC32 mismatch");
-         }
-      },
-
-      /**
-       * Read the central part of a zip file and add the info in this object.
-       * @param {StreamReader} reader the reader to use.
-       */
-      readCentralPart : function(reader) {
-         this.versionMadeBy          = reader.readString(2);
-         this.versionNeeded          = reader.readInt(2);
-         this.bitFlag                = reader.readInt(2);
-         this.compressionMethod      = reader.readString(2);
-         this.date                   = reader.readDate();
-         this.crc32                  = reader.readInt(4);
-         this.compressedSize         = reader.readInt(4);
-         this.uncompressedSize       = reader.readInt(4);
-         this.fileNameLength         = reader.readInt(2);
-         this.extraFieldsLength      = reader.readInt(2);
-         this.fileCommentLength      = reader.readInt(2);
-         this.diskNumberStart        = reader.readInt(2);
-         this.internalFileAttributes = reader.readInt(2);
-         this.externalFileAttributes = reader.readInt(4);
-         this.localHeaderOffset      = reader.readInt(4);
-
-         if (this.isEncrypted()) {
-            throw new Error("Encrypted zip are not supported");
-         }
-
-         this.fileName = reader.readString(this.fileNameLength);
-         this.readExtraFields(reader);
-         this.parseZIP64ExtraField(reader);
-         this.fileComment = reader.readString(this.fileCommentLength);
-
-         // warning, this is true only for zip with madeBy == DOS (plateform dependent feature)
-         this.dir = this.externalFileAttributes & 0x00000010 ? true : false;
-      },
-      /**
-       * Parse the ZIP64 extra field and merge the info in the current ZipEntry.
-       * @param {StreamReader} reader the reader to use.
-       */
-      parseZIP64ExtraField : function(reader) {
-
-         if(!this.extraFields[0x0001]) {
-            return;
-         }
-
-         // should be something, preparing the extra reader
-         var extraReader = new StreamReader(this.extraFields[0x0001].value);
-
-         // I really hope that these 64bits integer can fit in 32 bits integer, because js
-         // won't let us have more.
-         if(this.uncompressedSize === MAX_VALUE_32BITS) {
-            this.uncompressedSize = extraReader.readInt(8);
-         }
-         if(this.compressedSize === MAX_VALUE_32BITS) {
-            this.compressedSize = extraReader.readInt(8);
-         }
-         if(this.localHeaderOffset === MAX_VALUE_32BITS) {
-            this.localHeaderOffset = extraReader.readInt(8);
-         }
-         if(this.diskNumberStart === MAX_VALUE_32BITS) {
-            this.diskNumberStart = extraReader.readInt(4);
-         }
-      },
-      /**
-       * Read the central part of a zip file and add the info in this object.
-       * @param {StreamReader} reader the reader to use.
-       */
-      readExtraFields : function(reader) {
-         var start = reader.index,
-             extraFieldId,
-             extraFieldLength,
-             extraFieldValue;
-
-         this.extraFields = this.extraFields || {};
-
-         while (reader.index < start + this.extraFieldsLength) {
-            extraFieldId     = reader.readInt(2);
-            extraFieldLength = reader.readInt(2);
-            extraFieldValue  = reader.readString(extraFieldLength);
-
-            this.extraFields[extraFieldId] = {
-               id:     extraFieldId,
-               length: extraFieldLength,
-               value:  extraFieldValue
-            };
-         }
-      },
-      /**
-       * Apply an UTF8 transformation if needed.
-       */
-      handleUTF8 : function() {
-         if (this.useUTF8()) {
-            this.fileName    = JSZip.prototype.utf8decode(this.fileName);
-            this.fileComment = JSZip.prototype.utf8decode(this.fileComment);
-         }
-      }
-   };
-   // }}} end of ZipEntry
-
-   //  class ZipEntries {{{
-   /**
-    * All the entries in the zip file.
-    * @constructor
-    * @param {String|ArrayBuffer|Uint8Array} data the binary stream to load.
-    * @param {Object} loadOptions Options for loading the stream.
-    */
-   function ZipEntries(data, loadOptions) {
-      this.files = [];
-      this.loadOptions = loadOptions;
-      if (data) {
-         this.load(data);
-      }
-   }
-   ZipEntries.prototype = {
-      /**
-       * Check that the reader is on the speficied signature.
-       * @param {string} expectedSignature the expected signature.
-       * @throws {Error} if it is an other signature.
-       */
-      checkSignature : function(expectedSignature) {
-         var signature = this.reader.readString(4);
-         if (signature !== expectedSignature) {
-            throw new Error("Corrupted zip or bug : unexpected signature " +
-                            "(" + pretty(signature) + ", expected " + pretty(expectedSignature) + ")");
-         }
-      },
-      /**
-       * Read the end of the central directory.
-       */
-      readBlockEndOfCentral : function () {
-         this.diskNumber                  = this.reader.readInt(2);
-         this.diskWithCentralDirStart     = this.reader.readInt(2);
-         this.centralDirRecordsOnThisDisk = this.reader.readInt(2);
-         this.centralDirRecords           = this.reader.readInt(2);
-         this.centralDirSize              = this.reader.readInt(4);
-         this.centralDirOffset            = this.reader.readInt(4);
-
-         this.zipCommentLength            = this.reader.readInt(2);
-         this.zipComment                  = this.reader.readString(this.zipCommentLength);
-      },
-      /**
-       * Read the end of the Zip 64 central directory.
-       * Not merged with the method readEndOfCentral :
-       * The end of central can coexist with its Zip64 brother,
-       * I don't want to read the wrong number of bytes !
-       */
-      readBlockZip64EndOfCentral : function () {
-         this.zip64EndOfCentralSize       = this.reader.readInt(8);
-         this.versionMadeBy               = this.reader.readString(2);
-         this.versionNeeded               = this.reader.readInt(2);
-         this.diskNumber                  = this.reader.readInt(4);
-         this.diskWithCentralDirStart     = this.reader.readInt(4);
-         this.centralDirRecordsOnThisDisk = this.reader.readInt(8);
-         this.centralDirRecords           = this.reader.readInt(8);
-         this.centralDirSize              = this.reader.readInt(8);
-         this.centralDirOffset            = this.reader.readInt(8);
-
-         this.zip64ExtensibleData = {};
-         var extraDataSize = this.zip64EndOfCentralSize - 44,
-         index = 0,
-         extraFieldId,
-         extraFieldLength,
-         extraFieldValue;
-         while(index < extraDataSize) {
-            extraFieldId     = this.reader.readInt(2);
-            extraFieldLength = this.reader.readInt(4);
-            extraFieldValue  = this.reader.readString(extraFieldLength);
-            this.zip64ExtensibleData[extraFieldId] = {
-               id:     extraFieldId,
-               length: extraFieldLength,
-               value:  extraFieldValue
-            };
-         }
-      },
-      /**
-       * Read the end of the Zip 64 central directory locator.
-       */
-      readBlockZip64EndOfCentralLocator : function () {
-         this.diskWithZip64CentralDirStart       = this.reader.readInt(4);
-         this.relativeOffsetEndOfZip64CentralDir = this.reader.readInt(8);
-         this.disksCount                         = this.reader.readInt(4);
-         if (this.disksCount > 1) {
-            throw new Error("Multi-volumes zip are not supported");
-         }
-      },
-      /**
-       * Read the local files, based on the offset read in the central part.
-       */
-      readLocalFiles : function() {
-         var i, file;
-         for(i = 0; i < this.files.length; i++) {
-            file = this.files[i];
-            this.reader.setIndex(file.localHeaderOffset);
-            this.checkSignature(JSZip.signature.LOCAL_FILE_HEADER);
-            file.readLocalPart(this.reader);
-            file.handleUTF8();
-         }
-      },
-      /**
-       * Read the central directory.
-       */
-      readCentralDir : function() {
-         var file;
-
-         this.reader.setIndex(this.centralDirOffset);
-         while(this.reader.readString(4) === JSZip.signature.CENTRAL_FILE_HEADER) {
-            file = new ZipEntry({
-               zip64: this.zip64
-            }, this.loadOptions);
-            file.readCentralPart(this.reader);
-            this.files.push(file);
-         }
-      },
-      /**
-       * Read the end of central directory.
-       */
-      readEndOfCentral : function() {
-            var offset = this.reader.stream.lastIndexOf(JSZip.signature.CENTRAL_DIRECTORY_END);
-            if (offset === -1) {
-               throw new Error("Corrupted zip : can't find end of central directory");
-            }
-            this.reader.setIndex(offset);
-            this.checkSignature(JSZip.signature.CENTRAL_DIRECTORY_END);
-            this.readBlockEndOfCentral();
-
-         
-            /* extract from the zip spec :
-               4)  If one of the fields in the end of central directory
-                   record is too small to hold required data, the field
-                   should be set to -1 (0xFFFF or 0xFFFFFFFF) and the
-                   ZIP64 format record should be created.
-               5)  The end of central directory record and the
-                   Zip64 end of central directory locator record must
-                   reside on the same disk when splitting or spanning
-                   an archive.
-            */
-            if (  this.diskNumber                  === MAX_VALUE_16BITS
-               || this.diskWithCentralDirStart     === MAX_VALUE_16BITS
-               || this.centralDirRecordsOnThisDisk === MAX_VALUE_16BITS
-               || this.centralDirRecords           === MAX_VALUE_16BITS
-               || this.centralDirSize              === MAX_VALUE_32BITS
-               || this.centralDirOffset            === MAX_VALUE_32BITS
-            ) {
-               this.zip64 = true;
-
-               /*
-               Warning : the zip64 extension is supported, but ONLY if the 64bits integer read from
-               the zip file can fit into a 32bits integer. This cannot be solved : Javascript represents
-               all numbers as 64-bit double precision IEEE 754 floating point numbers.
-               So, we have 53bits for integers and bitwise operations treat everything as 32bits.
-               see https://developer.mozilla.org/en-US/docs/JavaScript/Reference/Operators/Bitwise_Operators
-               and http://www.ecma-international.org/publications/files/ECMA-ST/ECMA-262.pdf section 8.5
-               */
-
-               // should look for a zip64 EOCD locator
-               offset = this.reader.stream.lastIndexOf(JSZip.signature.ZIP64_CENTRAL_DIRECTORY_LOCATOR);
-               if (offset === -1) {
-                  throw new Error("Corrupted zip : can't find the ZIP64 end of central directory locator");
-               }
-               this.reader.setIndex(offset);
-               this.checkSignature(JSZip.signature.ZIP64_CENTRAL_DIRECTORY_LOCATOR);
-               this.readBlockZip64EndOfCentralLocator();
-
-               // now the zip64 EOCD record
-               this.reader.setIndex(this.relativeOffsetEndOfZip64CentralDir);
-               this.checkSignature(JSZip.signature.ZIP64_CENTRAL_DIRECTORY_END);
-               this.readBlockZip64EndOfCentral();
-            }
-      },
-      /**
-       * Read a zip file and create ZipEntries.
-       * @param {String|ArrayBuffer|Uint8Array} data the binary string representing a zip file.
-       */
-      load : function(data) {
-         this.reader = new StreamReader(data);
-
-         this.readEndOfCentral();
-         this.readCentralDir();
-         this.readLocalFiles();
-      }
-   };
-   // }}} end of ZipEntries
-
-   /**
-    * Implementation of the load method of JSZip.
-    * It uses the above classes to decode a zip file, and load every files.
-    * @param {String|ArrayBuffer|Uint8Array} data the data to load.
-    * @param {Object} options Options for loading the stream.
-    *  options.base64 : is the stream in base64 ? default : false
-    */
-   JSZip.prototype.load = function(data, options) {
-      var files, zipEntries, i, input;
-      options = options || {};
-      if(options.base64) {
-         data = JSZipBase64.decode(data);
-      }
-
-      zipEntries = new ZipEntries(data, options);
-      files = zipEntries.files;
-      for (i = 0; i < files.length; i++) {
-         input = files[i];
-         this.file(input.fileName, input.uncompressedFileData, {
-            binary:true,
-            optimizedBinaryString:true,
-            date:input.date,
-            dir:input.dir
-         });
-      }
-
-      return this;
-   };
-
-}());
-// enforcing Stuk's coding style
-// vim: set shiftwidth=3 softtabstop=3 foldmethod=marker:
-// Module: mammoth@0.2.0-dev
+// Module: mammoth@0.3.1
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => unzip@0.1.9
+// Module: mammoth@0.3.1 => underscore@1.6.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => unzip@0.1.9 => setimmediate@1.0.1
-// License: MIT
-// 
-// Module: mammoth@0.2.0-dev => unzip@0.1.9 => readable-stream@1.0.26-2
-// License: BSD
-// 
-// Module: mammoth@0.2.0-dev => unzip@0.1.9 => readable-stream@1.0.26-2 => string_decoder@0.10.25-1
-// License: MIT
-// 
-// Module: mammoth@0.2.0-dev => unzip@0.1.9 => pullstream@0.4.0
-// License: MIT
-// 
-// Module: mammoth@0.2.0-dev => unzip@0.1.9 => pullstream@0.4.0 => slice-stream@0.0.0
-// License: MIT
-// 
-// Module: mammoth@0.2.0-dev => unzip@0.1.9 => pullstream@0.4.0 => over@0.0.5
-// License: MIT
-// 
-// Module: mammoth@0.2.0-dev => unzip@0.1.9 => match-stream@0.0.2
-// License: MIT
-// 
-// Module: mammoth@0.2.0-dev => unzip@0.1.9 => fstream@0.1.25
-// License: BSD
-// 
-// Module: mammoth@0.2.0-dev => unzip@0.1.9 => fstream@0.1.25 => rimraf@2.2.6
-// License: MIT
-// 
-// Module: mammoth@0.2.0-dev => unzip@0.1.9 => fstream@0.1.25 => mkdirp@0.3.5
-// License: MIT
-// 
-// Module: mammoth@0.2.0-dev => unzip@0.1.9 => fstream@0.1.25 => inherits@2.0.1
-// License: ISC
-// 
-// Module: mammoth@0.2.0-dev => unzip@0.1.9 => fstream@0.1.25 => graceful-fs@2.0.3
-// License: BSD
-// 
-// Module: mammoth@0.2.0-dev => unzip@0.1.9 => binary@0.3.0
-// License: MIT
-// 
-// Module: mammoth@0.2.0-dev => unzip@0.1.9 => binary@0.3.0 => chainsaw@0.1.0
-// License: MIT/X11
-// 
-// Module: mammoth@0.2.0-dev => unzip@0.1.9 => binary@0.3.0 => chainsaw@0.1.0 => traverse@0.3.9
-// License: MIT/X11
-// 
-// Module: mammoth@0.2.0-dev => underscore@1.4.4
-// License: MIT
-// 
-// Module: mammoth@0.2.0-dev => uglify-js@2.4.13
+// Module: mammoth@0.3.1 => uglify-js@2.4.13
 // License: BSD 2-Clause
 // 
-// Module: mammoth@0.2.0-dev => uglify-js@2.4.13 => uglify-to-browserify@1.0.2
+// Module: mammoth@0.3.1 => uglify-js@2.4.13 => uglify-to-browserify@1.0.2
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => uglify-js@2.4.13 => source-map@0.1.33
+// Module: mammoth@0.3.1 => uglify-js@2.4.13 => source-map@0.1.33
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => uglify-js@2.4.13 => source-map@0.1.33 => amdefine@0.1.0
+// Module: mammoth@0.3.1 => uglify-js@2.4.13 => source-map@0.1.33 => amdefine@0.1.0
 // License: BSD, MIT
 // 
-// Module: mammoth@0.2.0-dev => uglify-js@2.4.13 => optimist@0.3.7
+// Module: mammoth@0.3.1 => uglify-js@2.4.13 => optimist@0.3.7
 // License: MIT/X11
 // 
-// Module: mammoth@0.2.0-dev => uglify-js@2.4.13 => optimist@0.3.7 => wordwrap@0.0.2
+// Module: mammoth@0.3.1 => uglify-js@2.4.13 => optimist@0.3.7 => wordwrap@0.0.2
 // License: MIT/X11
 // 
-// Module: mammoth@0.2.0-dev => temp@0.7.0
+// Module: mammoth@0.3.1 => temp@0.7.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => temp@0.7.0 => rimraf@2.2.6
+// Module: mammoth@0.3.1 => temp@0.7.0 => rimraf@2.2.6
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => stream-buffers@0.2.5
-// License: Public domain
-// 
-// Module: mammoth@0.2.0-dev => sax@0.5.8
+// Module: mammoth@0.3.1 => sax@0.5.8
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => nomnom@1.6.2
+// Module: mammoth@0.3.1 => nomnom@1.6.2
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => nomnom@1.6.2 => colors@0.5.1
+// Module: mammoth@0.3.1 => nomnom@1.6.2 => colors@0.5.1
 // License: Unknown license
 // 
-// Module: mammoth@0.2.0-dev => mocha@1.8.2
+// Module: mammoth@0.3.1 => mocha@1.8.2
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => mocha@1.8.2 => ms@0.3.0
+// Module: mammoth@0.3.1 => mocha@1.8.2 => ms@0.3.0
 // License: Unknown license
 // 
-// Module: mammoth@0.2.0-dev => mocha@1.8.2 => mkdirp@0.3.3
+// Module: mammoth@0.3.1 => mocha@1.8.2 => mkdirp@0.3.3
 // License: MIT/X11
 // 
-// Module: mammoth@0.2.0-dev => mocha@1.8.2 => jade@0.26.3
+// Module: mammoth@0.3.1 => mocha@1.8.2 => jade@0.26.3
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => mocha@1.8.2 => jade@0.26.3 => mkdirp@0.3.0
+// Module: mammoth@0.3.1 => mocha@1.8.2 => jade@0.26.3 => mkdirp@0.3.0
 // License: MIT/X11
 // 
-// Module: mammoth@0.2.0-dev => mocha@1.8.2 => growl@1.7.0
+// Module: mammoth@0.3.1 => mocha@1.8.2 => growl@1.7.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => mocha@1.8.2 => diff@1.0.2
+// Module: mammoth@0.3.1 => mocha@1.8.2 => diff@1.0.2
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => mocha@1.8.2 => debug@0.7.4
+// Module: mammoth@0.3.1 => mocha@1.8.2 => debug@0.7.4
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => mocha@1.8.2 => commander@0.6.1
+// Module: mammoth@0.3.1 => mocha@1.8.2 => commander@0.6.1
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => lop@0.2.8
+// Module: mammoth@0.3.1 => lop@0.2.8
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => lop@0.2.8 => option@0.2.1
+// Module: mammoth@0.3.1 => lop@0.2.8 => option@0.2.1
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => license-sniffer@0.1.1
+// Module: mammoth@0.3.1 => license-sniffer@0.1.1
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => license-sniffer@0.1.1 => q@0.9.7
+// Module: mammoth@0.3.1 => license-sniffer@0.1.1 => q@0.9.7
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => license-sniffer@0.1.1 => optimist@0.3.7
+// Module: mammoth@0.3.1 => license-sniffer@0.1.1 => optimist@0.3.7
 // License: MIT/X11
 // 
-// Module: mammoth@0.2.0-dev => license-sniffer@0.1.1 => optimist@0.3.7 => wordwrap@0.0.2
+// Module: mammoth@0.3.1 => license-sniffer@0.1.1 => optimist@0.3.7 => wordwrap@0.0.2
 // License: MIT/X11
 // 
-// Module: mammoth@0.2.0-dev => license-sniffer@0.1.1 => natural@0.1.26
+// Module: mammoth@0.3.1 => license-sniffer@0.1.1 => natural@0.1.26
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => license-sniffer@0.1.1 => natural@0.1.26 => sylvester@0.0.21
+// Module: mammoth@0.3.1 => license-sniffer@0.1.1 => natural@0.1.26 => sylvester@0.0.21
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => license-sniffer@0.1.1 => natural@0.1.26 => apparatus@0.0.8
+// Module: mammoth@0.3.1 => license-sniffer@0.1.1 => natural@0.1.26 => apparatus@0.0.8
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => license-sniffer@0.1.1 => markdown@0.4.0
+// Module: mammoth@0.3.1 => license-sniffer@0.1.1 => markdown@0.4.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => license-sniffer@0.1.1 => markdown@0.4.0 => nopt@1.0.10
+// Module: mammoth@0.3.1 => license-sniffer@0.1.1 => markdown@0.4.0 => nopt@1.0.10
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => license-sniffer@0.1.1 => markdown@0.4.0 => nopt@1.0.10 => abbrev@1.0.4
+// Module: mammoth@0.3.1 => license-sniffer@0.1.1 => markdown@0.4.0 => nopt@1.0.10 => abbrev@1.0.4
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => duck@0.1.11
+// Module: mammoth@0.3.1 => jszip@2.2.0
+// License: MIT or GPLv3
+// 
+// Module: mammoth@0.3.1 => jszip@2.2.0 => zlibjs@0.2.0
+// License: MIT
+// 
+// Module: mammoth@0.3.1 => duck@0.1.11
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => buffers@0.1.1
-// License: Unknown license
-// 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0
+// Module: mammoth@0.3.1 => browserify@3.33.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => zlib-browserify@0.0.3
+// Module: mammoth@0.3.1 => browserify@3.33.0 => zlib-browserify@0.0.3
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => zlib-browserify@0.0.3 => tape@0.2.2
+// Module: mammoth@0.3.1 => browserify@3.33.0 => zlib-browserify@0.0.3 => tape@0.2.2
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => zlib-browserify@0.0.3 => tape@0.2.2 => jsonify@0.0.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => zlib-browserify@0.0.3 => tape@0.2.2 => jsonify@0.0.0
 // License: Public Domain
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => zlib-browserify@0.0.3 => tape@0.2.2 => deep-equal@0.0.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => zlib-browserify@0.0.3 => tape@0.2.2 => deep-equal@0.0.0
 // License: MIT/X11
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => vm-browserify@0.0.4
+// Module: mammoth@0.3.1 => browserify@3.33.0 => vm-browserify@0.0.4
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => vm-browserify@0.0.4 => indexof@0.0.1
+// Module: mammoth@0.3.1 => browserify@3.33.0 => vm-browserify@0.0.4 => indexof@0.0.1
 // License: Unknown license
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => util@0.10.3
+// Module: mammoth@0.3.1 => browserify@3.33.0 => util@0.10.3
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => url@0.7.9
+// Module: mammoth@0.3.1 => browserify@3.33.0 => url@0.7.9
 // License: Unknown license
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => url@0.7.9 => querystring@0.1.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => url@0.7.9 => querystring@0.1.0
 // License: Unknown license
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => url@0.7.9 => punycode@1.0.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => url@0.7.9 => punycode@1.0.0
 // License: MIT, GPL
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => umd@2.0.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => umd@2.0.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => umd@2.0.0 => ruglify@1.0.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => umd@2.0.0 => ruglify@1.0.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => umd@2.0.0 => ruglify@1.0.0 => uglify-js@2.2.5
+// Module: mammoth@0.3.1 => browserify@3.33.0 => umd@2.0.0 => ruglify@1.0.0 => uglify-js@2.2.5
 // License: Unknown license
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => umd@2.0.0 => ruglify@1.0.0 => uglify-js@2.2.5 => source-map@0.1.33
+// Module: mammoth@0.3.1 => browserify@3.33.0 => umd@2.0.0 => ruglify@1.0.0 => uglify-js@2.2.5 => source-map@0.1.33
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => umd@2.0.0 => ruglify@1.0.0 => uglify-js@2.2.5 => source-map@0.1.33 => amdefine@0.1.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => umd@2.0.0 => ruglify@1.0.0 => uglify-js@2.2.5 => source-map@0.1.33 => amdefine@0.1.0
 // License: BSD, MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => umd@2.0.0 => ruglify@1.0.0 => uglify-js@2.2.5 => optimist@0.3.7
+// Module: mammoth@0.3.1 => browserify@3.33.0 => umd@2.0.0 => ruglify@1.0.0 => uglify-js@2.2.5 => optimist@0.3.7
 // License: MIT/X11
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => umd@2.0.0 => ruglify@1.0.0 => uglify-js@2.2.5 => optimist@0.3.7 => wordwrap@0.0.2
+// Module: mammoth@0.3.1 => browserify@3.33.0 => umd@2.0.0 => ruglify@1.0.0 => uglify-js@2.2.5 => optimist@0.3.7 => wordwrap@0.0.2
 // License: MIT/X11
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => umd@2.0.0 => rfile@1.0.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => umd@2.0.0 => rfile@1.0.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => umd@2.0.0 => rfile@1.0.0 => resolve@0.3.1
+// Module: mammoth@0.3.1 => browserify@3.33.0 => umd@2.0.0 => rfile@1.0.0 => resolve@0.3.1
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => umd@2.0.0 => rfile@1.0.0 => callsite@1.0.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => umd@2.0.0 => rfile@1.0.0 => callsite@1.0.0
 // License: Unknown license
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => tty-browserify@0.0.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => tty-browserify@0.0.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => timers-browserify@1.0.1
+// Module: mammoth@0.3.1 => browserify@3.33.0 => timers-browserify@1.0.1
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => timers-browserify@1.0.1 => process@0.5.2
+// Module: mammoth@0.3.1 => browserify@3.33.0 => timers-browserify@1.0.1 => process@0.5.2
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => through@2.3.4
+// Module: mammoth@0.3.1 => browserify@3.33.0 => through@2.3.4
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => syntax-error@1.1.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => syntax-error@1.1.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => syntax-error@1.1.0 => esprima-fb@3001.1.0-dev-harmony-fb
+// Module: mammoth@0.3.1 => browserify@3.33.0 => syntax-error@1.1.0 => esprima-fb@3001.1.0-dev-harmony-fb
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => subarg@0.0.1
+// Module: mammoth@0.3.1 => browserify@3.33.0 => subarg@0.0.1
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => subarg@0.0.1 => minimist@0.0.8
+// Module: mammoth@0.3.1 => browserify@3.33.0 => subarg@0.0.1 => minimist@0.0.8
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => string_decoder@0.0.1
+// Module: mammoth@0.3.1 => browserify@3.33.0 => string_decoder@0.0.1
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => stream-combiner@0.0.4
+// Module: mammoth@0.3.1 => browserify@3.33.0 => stream-combiner@0.0.4
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => stream-browserify@0.1.3
+// Module: mammoth@0.3.1 => browserify@3.33.0 => stream-browserify@0.1.3
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => stream-browserify@0.1.3 => process@0.5.2
+// Module: mammoth@0.3.1 => browserify@3.33.0 => stream-browserify@0.1.3 => process@0.5.2
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => shell-quote@0.0.1
+// Module: mammoth@0.3.1 => browserify@3.33.0 => shell-quote@0.0.1
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => shallow-copy@0.0.1
+// Module: mammoth@0.3.1 => browserify@3.33.0 => shallow-copy@0.0.1
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => resolve@0.6.2
+// Module: mammoth@0.3.1 => browserify@3.33.0 => resolve@0.6.2
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => querystring-es3@0.2.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => querystring-es3@0.2.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => punycode@1.2.4
+// Module: mammoth@0.3.1 => browserify@3.33.0 => punycode@1.2.4
 // License: MIT, GPL
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => path-browserify@0.0.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => path-browserify@0.0.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => parents@0.0.2
+// Module: mammoth@0.3.1 => browserify@3.33.0 => parents@0.0.2
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => os-browserify@0.1.2
+// Module: mammoth@0.3.1 => browserify@3.33.0 => os-browserify@0.1.2
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => module-deps@1.8.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => module-deps@1.8.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => module-deps@1.8.0 => minimist@0.0.8
+// Module: mammoth@0.3.1 => browserify@3.33.0 => module-deps@1.8.0 => minimist@0.0.8
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => module-deps@1.8.0 => detective@3.1.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => module-deps@1.8.0 => detective@3.1.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => module-deps@1.8.0 => detective@3.1.0 => esprima-fb@3001.1.0-dev-harmony-fb
+// Module: mammoth@0.3.1 => browserify@3.33.0 => module-deps@1.8.0 => detective@3.1.0 => esprima-fb@3001.1.0-dev-harmony-fb
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => module-deps@1.8.0 => detective@3.1.0 => escodegen@1.1.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => module-deps@1.8.0 => detective@3.1.0 => escodegen@1.1.0
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => module-deps@1.8.0 => detective@3.1.0 => escodegen@1.1.0 => source-map@0.1.33
+// Module: mammoth@0.3.1 => browserify@3.33.0 => module-deps@1.8.0 => detective@3.1.0 => escodegen@1.1.0 => source-map@0.1.33
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => module-deps@1.8.0 => detective@3.1.0 => escodegen@1.1.0 => source-map@0.1.33 => amdefine@0.1.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => module-deps@1.8.0 => detective@3.1.0 => escodegen@1.1.0 => source-map@0.1.33 => amdefine@0.1.0
 // License: BSD, MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => module-deps@1.8.0 => detective@3.1.0 => escodegen@1.1.0 => esutils@1.0.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => module-deps@1.8.0 => detective@3.1.0 => escodegen@1.1.0 => esutils@1.0.0
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => module-deps@1.8.0 => detective@3.1.0 => escodegen@1.1.0 => estraverse@1.5.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => module-deps@1.8.0 => detective@3.1.0 => escodegen@1.1.0 => estraverse@1.5.0
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => module-deps@1.8.0 => detective@3.1.0 => escodegen@1.1.0 => esprima@1.0.4
+// Module: mammoth@0.3.1 => browserify@3.33.0 => module-deps@1.8.0 => detective@3.1.0 => escodegen@1.1.0 => esprima@1.0.4
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => insert-module-globals@4.1.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => insert-module-globals@4.1.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => insert-module-globals@4.1.0 => process@0.5.2
+// Module: mammoth@0.3.1 => browserify@3.33.0 => insert-module-globals@4.1.0 => process@0.5.2
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => insert-module-globals@4.1.0 => lexical-scope@1.1.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => insert-module-globals@4.1.0 => lexical-scope@1.1.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => insert-module-globals@4.1.0 => lexical-scope@1.1.0 => astw@1.1.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => insert-module-globals@4.1.0 => lexical-scope@1.1.0 => astw@1.1.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => insert-module-globals@4.1.0 => lexical-scope@1.1.0 => astw@1.1.0 => esprima-fb@3001.1.0-dev-harmony-fb
+// Module: mammoth@0.3.1 => browserify@3.33.0 => insert-module-globals@4.1.0 => lexical-scope@1.1.0 => astw@1.1.0 => esprima-fb@3001.1.0-dev-harmony-fb
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => inherits@2.0.1
+// Module: mammoth@0.3.1 => browserify@3.33.0 => inherits@2.0.1
 // License: ISC
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => https-browserify@0.0.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => https-browserify@0.0.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => http-browserify@1.3.2
+// Module: mammoth@0.3.1 => browserify@3.33.0 => http-browserify@1.3.2
 // License: MIT/X11
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => http-browserify@1.3.2 => Base64@0.2.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => http-browserify@1.3.2 => Base64@0.2.0
 // License: WTFPL
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => glob@3.2.9
+// Module: mammoth@0.3.1 => browserify@3.33.0 => glob@3.2.9
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => glob@3.2.9 => minimatch@0.2.14
+// Module: mammoth@0.3.1 => browserify@3.33.0 => glob@3.2.9 => minimatch@0.2.14
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => glob@3.2.9 => minimatch@0.2.14 => sigmund@1.0.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => glob@3.2.9 => minimatch@0.2.14 => sigmund@1.0.0
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => glob@3.2.9 => minimatch@0.2.14 => lru-cache@2.5.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => glob@3.2.9 => minimatch@0.2.14 => lru-cache@2.5.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => events@1.0.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => events@1.0.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => duplexer@0.1.1
+// Module: mammoth@0.3.1 => browserify@3.33.0 => duplexer@0.1.1
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => domain-browser@1.1.1
+// Module: mammoth@0.3.1 => browserify@3.33.0 => domain-browser@1.1.1
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => derequire@0.6.1
+// Module: mammoth@0.3.1 => browserify@3.33.0 => derequire@0.6.1
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => derequire@0.6.1 => estraverse@1.5.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => derequire@0.6.1 => estraverse@1.5.0
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => derequire@0.6.1 => esrefactor@0.1.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => derequire@0.6.1 => esrefactor@0.1.0
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => derequire@0.6.1 => esrefactor@0.1.0 => estraverse@0.0.4
+// Module: mammoth@0.3.1 => browserify@3.33.0 => derequire@0.6.1 => esrefactor@0.1.0 => estraverse@0.0.4
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => derequire@0.6.1 => esrefactor@0.1.0 => esprima@1.0.4
+// Module: mammoth@0.3.1 => browserify@3.33.0 => derequire@0.6.1 => esrefactor@0.1.0 => esprima@1.0.4
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => derequire@0.6.1 => esrefactor@0.1.0 => escope@0.0.16
+// Module: mammoth@0.3.1 => browserify@3.33.0 => derequire@0.6.1 => esrefactor@0.1.0 => escope@0.0.16
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => derequire@0.6.1 => esprima-six@0.0.3
+// Module: mammoth@0.3.1 => browserify@3.33.0 => derequire@0.6.1 => esprima-six@0.0.3
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => deps-sort@0.1.1
+// Module: mammoth@0.3.1 => browserify@3.33.0 => deps-sort@0.1.1
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => deps-sort@0.1.1 => minimist@0.0.8
+// Module: mammoth@0.3.1 => browserify@3.33.0 => deps-sort@0.1.1 => minimist@0.0.8
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => deps-sort@0.1.1 => JSONStream@0.6.4
+// Module: mammoth@0.3.1 => browserify@3.33.0 => deps-sort@0.1.1 => JSONStream@0.6.4
 // License: Unknown license
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => deps-sort@0.1.1 => JSONStream@0.6.4 => through@2.2.7
+// Module: mammoth@0.3.1 => browserify@3.33.0 => deps-sort@0.1.1 => JSONStream@0.6.4 => through@2.2.7
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => deps-sort@0.1.1 => JSONStream@0.6.4 => jsonparse@0.0.5
+// Module: mammoth@0.3.1 => browserify@3.33.0 => deps-sort@0.1.1 => JSONStream@0.6.4 => jsonparse@0.0.5
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => defined@0.0.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => defined@0.0.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => deep-equal@0.1.2
+// Module: mammoth@0.3.1 => browserify@3.33.0 => deep-equal@0.1.2
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => crypto-browserify@1.0.9
+// Module: mammoth@0.3.1 => browserify@3.33.0 => crypto-browserify@1.0.9
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => constants-browserify@0.0.1
+// Module: mammoth@0.3.1 => browserify@3.33.0 => constants-browserify@0.0.1
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => console-browserify@1.0.3
+// Module: mammoth@0.3.1 => browserify@3.33.0 => console-browserify@1.0.3
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => concat-stream@1.4.4
+// Module: mammoth@0.3.1 => browserify@3.33.0 => concat-stream@1.4.4
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => concat-stream@1.4.4 => typedarray@0.0.5
+// Module: mammoth@0.3.1 => browserify@3.33.0 => concat-stream@1.4.4 => typedarray@0.0.5
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => concat-stream@1.4.4 => readable-stream@1.1.11
+// Module: mammoth@0.3.1 => browserify@3.33.0 => concat-stream@1.4.4 => readable-stream@1.1.11
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => concat-stream@1.4.4 => readable-stream@1.1.11 => string_decoder@0.10.25-1
+// Module: mammoth@0.3.1 => browserify@3.33.0 => concat-stream@1.4.4 => readable-stream@1.1.11 => string_decoder@0.10.25-1
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => concat-stream@1.4.4 => readable-stream@1.1.11 => debuglog@0.0.2
+// Module: mammoth@0.3.1 => browserify@3.33.0 => concat-stream@1.4.4 => readable-stream@1.1.11 => debuglog@0.0.2
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => concat-stream@1.4.4 => readable-stream@1.1.11 => core-util-is@1.0.1
+// Module: mammoth@0.3.1 => browserify@3.33.0 => concat-stream@1.4.4 => readable-stream@1.1.11 => core-util-is@1.0.1
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => commondir@0.0.1
+// Module: mammoth@0.3.1 => browserify@3.33.0 => commondir@0.0.1
 // License: MIT/X11
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => builtins@0.0.2
+// Module: mammoth@0.3.1 => browserify@3.33.0 => builtins@0.0.2
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => buffer@2.1.5
+// Module: mammoth@0.3.1 => browserify@3.33.0 => buffer@2.1.5
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => buffer@2.1.5 => ieee754@1.1.3
+// Module: mammoth@0.3.1 => browserify@3.33.0 => buffer@2.1.5 => ieee754@1.1.3
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => buffer@2.1.5 => base64-js@0.0.6
+// Module: mammoth@0.3.1 => browserify@3.33.0 => buffer@2.1.5 => base64-js@0.0.6
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => browser-resolve@1.2.2
+// Module: mammoth@0.3.1 => browserify@3.33.0 => browser-resolve@1.2.2
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => browser-resolve@1.2.2 => resolve@0.6.1
+// Module: mammoth@0.3.1 => browserify@3.33.0 => browser-resolve@1.2.2 => resolve@0.6.1
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => browser-pack@2.0.1
+// Module: mammoth@0.3.1 => browserify@3.33.0 => browser-pack@2.0.1
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => browser-pack@2.0.1 => combine-source-map@0.3.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => browser-pack@2.0.1 => combine-source-map@0.3.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => browser-pack@2.0.1 => combine-source-map@0.3.0 => source-map@0.1.33
+// Module: mammoth@0.3.1 => browserify@3.33.0 => browser-pack@2.0.1 => combine-source-map@0.3.0 => source-map@0.1.33
 // License: BSD
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => browser-pack@2.0.1 => combine-source-map@0.3.0 => source-map@0.1.33 => amdefine@0.1.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => browser-pack@2.0.1 => combine-source-map@0.3.0 => source-map@0.1.33 => amdefine@0.1.0
 // License: BSD, MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => browser-pack@2.0.1 => combine-source-map@0.3.0 => inline-source-map@0.3.0
+// Module: mammoth@0.3.1 => browserify@3.33.0 => browser-pack@2.0.1 => combine-source-map@0.3.0 => inline-source-map@0.3.0
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => browser-pack@2.0.1 => combine-source-map@0.3.0 => convert-source-map@0.3.3
+// Module: mammoth@0.3.1 => browserify@3.33.0 => browser-pack@2.0.1 => combine-source-map@0.3.0 => convert-source-map@0.3.3
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => browser-pack@2.0.1 => JSONStream@0.6.4
+// Module: mammoth@0.3.1 => browserify@3.33.0 => browser-pack@2.0.1 => JSONStream@0.6.4
 // License: Unknown license
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => browser-pack@2.0.1 => JSONStream@0.6.4 => through@2.2.7
+// Module: mammoth@0.3.1 => browserify@3.33.0 => browser-pack@2.0.1 => JSONStream@0.6.4 => through@2.2.7
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => browser-pack@2.0.1 => JSONStream@0.6.4 => jsonparse@0.0.5
+// Module: mammoth@0.3.1 => browserify@3.33.0 => browser-pack@2.0.1 => JSONStream@0.6.4 => jsonparse@0.0.5
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => assert@1.1.1
+// Module: mammoth@0.3.1 => browserify@3.33.0 => assert@1.1.1
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => assert@1.1.1 => util@0.10.2
+// Module: mammoth@0.3.1 => browserify@3.33.0 => assert@1.1.1 => util@0.10.2
 // License: Unknown license
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => JSONStream@0.7.1
+// Module: mammoth@0.3.1 => browserify@3.33.0 => JSONStream@0.7.1
 // License: Unknown license
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => JSONStream@0.7.1 => through@2.2.7
+// Module: mammoth@0.3.1 => browserify@3.33.0 => JSONStream@0.7.1 => through@2.2.7
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => browserify@3.33.0 => JSONStream@0.7.1 => jsonparse@0.0.5
+// Module: mammoth@0.3.1 => browserify@3.33.0 => JSONStream@0.7.1 => jsonparse@0.0.5
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => bluebird@1.1.1
+// Module: mammoth@0.3.1 => bluebird@1.1.1
 // License: MIT
 // 
-// Module: mammoth@0.2.0-dev => async@0.2.10
+// Module: mammoth@0.3.1 => async@0.2.10
 // License: MIT
 // 
 !function(e){if("object"==typeof exports)module.exports=e();else if("function"==typeof define&&define.amd)define(e);else{var f;"undefined"!=typeof window?f=window:"undefined"!=typeof global?f=global:"undefined"!=typeof self&&(f=self),f.mammoth=e()}}(function(){var define,module,exports;return (function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);throw new Error("Cannot find module '"+o+"'")}var f=n[o]={exports:{}};t[o][0].call(f.exports,function(e){var n=t[o][1][e];return s(n?n:e)},f,f.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(_dereq_,module,exports){
-(function (Buffer){
 var promises = _dereq_("../lib/promises");
+var zipfile = _dereq_("../lib/zipfile");
 
 exports.openZip = openZip;
 
 function openZip(options) {
     if (options.arrayBuffer) {
-        return openArrayBuffer(options.arrayBuffer);
+        return zipfile.openArrayBuffer(options.arrayBuffer);
     } else {
-        return q.reject(new Error("Could not find file in options"));
+        return promises.reject(new Error("Could not find file in options"));
     }
 }
 
-function openArrayBuffer(arrayBuffer) {
-    var zipFile = new JSZip(arrayBuffer);
-    function exists(name) {
-        return zipFile.file(name) !== null;
-    }
-    
-    function read(name, encoding) {
-        var array = zipFile.file(name).asUint8Array();
-        var buffer = new Buffer(array);
-        if (encoding) {
-            return promises.when(buffer.toString(encoding));
-        } else {
-            return promises.when(buffer);
-        }
-    }
-    return {
-        exists: exists,
-        read: read
-    };
-}
+},{"../lib/promises":18,"../lib/zipfile":22}],2:[function(_dereq_,module,exports){
+var _ = _dereq_("underscore");
 
-}).call(this,_dereq_("buffer").Buffer)
-},{"../lib/promises":15,"buffer":60}],2:[function(_dereq_,module,exports){
 exports.paragraph = paragraph;
 exports.run = run;
 
 
-function paragraph(styleName) {
-    return new Matcher("paragraph", styleName);
+function paragraph(options) {
+    return new Matcher("paragraph", options);
 }
 
-function run(styleName) {
-    return new Matcher("run", styleName);
+function run(options) {
+    return new Matcher("run", options);
 }
 
-function Matcher(elementType, styleName) {
+function Matcher(elementType, options) {
+    options = options || {};
     this._elementType = elementType;
-    this._styleName = styleName;
+    this._styleId = options.styleId;
+    this._styleName = options.styleName;
+    if (options.list) {
+        this._listIndex = options.list.levelIndex;
+        this._listIsOrdered = options.list.isOrdered;
+    }
 }
 
 Matcher.prototype.matches = function(element) {
     return element.type === this._elementType &&
+        (this._styleId === undefined || element.styleId === this._styleId) &&
         (this._styleName === undefined || element.styleName === this._styleName) &&
         (this._listIndex === undefined || isList(element, this._listIndex, this._listIsOrdered));
-}
-
-Matcher.prototype.orderedList = function(levelIndex) {
-    return this.list({isOrdered: true, levelIndex: levelIndex});
-}
-
-Matcher.prototype.unorderedList = function(levelIndex) {
-    return this.list({isOrdered: false, levelIndex: levelIndex});
-}
-
-Matcher.prototype.list = function(options) {
-    this._listIndex = options.levelIndex;
-    this._listIsOrdered = options.isOrdered;
-    return this;
 };
 
 function isList(element, levelIndex, isOrdered) {
@@ -4545,7 +501,7 @@ function isList(element, levelIndex, isOrdered) {
         element.numbering.isOrdered == isOrdered;
 }
 
-},{}],3:[function(_dereq_,module,exports){
+},{"underscore":114}],3:[function(_dereq_,module,exports){
 var promises = _dereq_("./promises");
 var async = _dereq_("async");
 
@@ -4565,6 +521,19 @@ if (typeof setImmediate === "undefined") {
 
 
 function DocumentConverter(options) {
+    return {
+        convertToHtml: function() {
+            var conversion = new DocumentConversion(options);
+            return conversion.convertToHtml.apply(this, arguments);
+        }
+    };
+}
+
+function DocumentConversion(options) {
+    var footnoteNumber = 1;
+    
+    var footnoteIds = [];
+    
     options = options || {};
     var defaultParagraphStyle = htmlPaths.topLevelElement("p");
     
@@ -4572,7 +541,7 @@ function DocumentConverter(options) {
     
     function convertToHtml(document) {
         var messages = [];
-        var html = new HtmlGenerator();
+        var html = new HtmlGenerator({prettyPrint: options.prettyPrint});
         
         return promises.nfcall(elementToHtml, document, html, messages).then(function() {
             html.closeAll();
@@ -4609,8 +578,8 @@ function DocumentConverter(options) {
         if (style) {
             return style.to;
         } else {
-            if (element.styleName) {
-                messages.push(results.warning("Unrecognised paragraph style: " + element.styleName));
+            if (element.styleId) {
+                messages.push(unrecognisedStyleWarning("paragraph", element));
             }
             return defaultParagraphStyle;
         }
@@ -4618,12 +587,12 @@ function DocumentConverter(options) {
     
     function convertRun(run, html, messages, callback) {
         var runHtml = new HtmlGenerator();
-        if (run.styleName) {
+        if (run.styleId) {
             var style = findStyle(run);
             if (style) {
                 runHtml.satisfyPath(style.to);
             } else {
-                messages.push(results.warning("Unrecognised run style: " + run.styleName));
+                messages.push(unrecognisedStyleWarning("run", run));
             }
         }
         if (run.isBold) {
@@ -4665,7 +634,25 @@ function DocumentConverter(options) {
 
     var elementConverters = {
         "document": function(document, html, messages, callback) {
-            convertElements(document.children, html, messages, callback);
+            convertElements(document.children, html, messages, function(error) {
+                if (error) {
+                    callback(error);
+                } else {
+                    html.closeAll();
+                    html.open(htmlPaths.element("ol"));
+                    var footnotes = footnoteIds.map(function(id) {
+                        return document.footnotes.findFootnoteById(id);
+                    });
+                    convertElements(footnotes, html, messages, function(error) {
+                        if (error) {
+                            callback(error);
+                        } else {
+                            html.close();
+                            callback();
+                        }
+                    });
+                }
+            });
         },
         "paragraph": convertParagraph,
         "run": convertRun,
@@ -4688,26 +675,71 @@ function DocumentConverter(options) {
                 }
             });
         },
+        "footnoteReference": function(element, html, messages, callback) {
+            html.open(htmlPaths.element("sup"));
+            html.open(htmlPaths.element("a", {href: "#footnote-" + element.footnoteId}));
+            footnoteIds.push(element.footnoteId);
+            html.text((footnoteNumber++).toString());
+            html.close();
+            html.close();
+            callback();
+        },
+        "footnote": function(element, html, messages, callback) {
+            html.open(htmlPaths.element("li", {id: "footnote-" + element.id}));
+            var footnoteHtml = new HtmlGenerator();
+            convertElements(element.body, footnoteHtml, messages, function(err) {
+                if (err) {
+                    callback(err);
+                } else {
+                    footnoteHtml.closeAll();
+                    html.append(footnoteHtml);
+                    html.close();
+                    callback();
+                }
+            });
+        },
         "image": options.convertImage || defaultConvertImage
     };
     return {
         convertToHtml: convertToHtml
-    }
+    };
 }
 
-},{"./html-generator":11,"./html-paths":12,"./promises":15,"./results":16,"async":19}],4:[function(_dereq_,module,exports){
-function Document(children) {
+function unrecognisedStyleWarning(type, element) {
+    return results.warning(
+        "Unrecognised " + type + " style: '" + element.styleName + "'" +
+        " (Style ID: " + element.styleId + ")"
+    );
+}
+
+},{"./html-generator":13,"./html-paths":14,"./promises":18,"./results":19,"async":23}],4:[function(_dereq_,module,exports){
+var types = {
+    document: "document",
+    paragraph: "paragraph",
+    run: "run",
+    text: "text",
+    tab: "tab",
+    hyperlink: "hyperlink",
+    footnoteReference: "footnoteReference",
+    image: "image",
+    footnote: "footnote"
+};
+
+function Document(children, options) {
+    options = options || {};
     return {
-        type: "document",
-        children: children
+        type: types.document,
+        children: children,
+        footnotes: options.footnotes || new Footnotes({})
     };
 }
 
 function Paragraph(children, properties) {
     properties = properties || {};
     return {
-        type: "paragraph",
+        type: types.paragraph,
         children: children,
+        styleId: properties.styleId || null,
         styleName: properties.styleName || null,
         numbering: properties.numbering || null,
         alignment: properties.alignment || null
@@ -4717,8 +749,9 @@ function Paragraph(children, properties) {
 function Run(children, properties) {
     properties = properties || {};
     return {
-        type: "run",
+        type: types.run,
         children: children,
+        styleId: properties.styleId || null,
         styleName: properties.styleName || null,
         isBold: properties.isBold,
         isItalic: properties.isItalic
@@ -4727,24 +760,47 @@ function Run(children, properties) {
 
 function Text(value) {
     return {
-        type: "text",
+        type: types.text,
         value: value
     };
 }
 
 function Tab(value) {
     return {
-        type: "tab"
+        type: types.tab
     };
 }
 
 function Hyperlink(children, options) {
     return {
-        type: "hyperlink",
+        type: types.hyperlink,
         children: children,
         href: options.href
     };
 }
+
+function FootnoteReference(options) {
+    return {
+        type: types.footnoteReference,
+        footnoteId: options.footnoteId
+    };
+}
+
+function Footnotes(footnotes) {
+    this._footnotes = footnotes;
+}
+
+Footnotes.prototype.findFootnoteById = function(id) {
+    return this._footnotes[id] || null;
+}
+
+function Footnote(options) {
+    return {
+        type: types.footnote,
+        body: options.body,
+        id: options.id
+    };
+};
 
 function ElementWithChildren(type) {
     return function(children, properties) {
@@ -4758,7 +814,7 @@ function ElementWithChildren(type) {
 
 function Image(options) {
     return {
-        type: "image",
+        type: types.image,
         read: options.readImage,
         altText: options.altText,
         contentType: options.contentType
@@ -4771,6 +827,9 @@ exports.Run = Run;
 exports.Text = Text;
 exports.Tab = Tab;
 exports.Hyperlink = Hyperlink;
+exports.FootnoteReference = FootnoteReference;
+exports.Footnotes = Footnotes;
+exports.Footnote = Footnote;
 exports.Image = Image;
 
 },{}],5:[function(_dereq_,module,exports){
@@ -4810,7 +869,7 @@ function readContentTypesFromXml(xml) {
                 return extensionDefaults[extension];
             }
         }
-    }
+    };
 }
 
 },{}],6:[function(_dereq_,module,exports){
@@ -4824,16 +883,39 @@ var Result = _dereq_("../results").Result;
 var warning = _dereq_("../results").warning;
 
 
-function DocumentXmlReader(relationships, contentTypes, docxFile, numbering) {
+function DocumentXmlReader(options) {
+    var relationships = options.relationships;
+    var contentTypes = options.contentTypes;
+    var docxFile = options.docxFile;
+    var numbering = options.numbering;
+    var styles = options.styles;
+    var rawFootnotes = options.footnotes || [];
+    
+    
     function convertXmlToDocument(documentXml) {
         var body = documentXml.root.first("w:body");
         
         var result = readXmlElements(body.children)
-            .map(function(children) {
-                return new documents.Document(children);
+            .flatMap(function(children) {
+                return readFootnotes().map(function(footnotes) {
+                    return new documents.Document(children, {footnotes: footnotes});
+                });
             });
         result.document = result.value;
         return result;
+    }
+    
+    function readFootnotes() {
+        return Result.combine(rawFootnotes.map(function(rawFootnote) {
+            return readXmlElements(rawFootnote.body).map(function(body) {
+                return new documents.Footnote({
+                    id: rawFootnote.id,
+                    body: body
+                });
+            });
+        })).map(function(footnotes) {
+            return new documents.Footnotes(_.indexBy(footnotes, "id"));
+        });
     }
 
     function readXmlElements(elements) {
@@ -4878,7 +960,12 @@ function DocumentXmlReader(relationships, contentTypes, docxFile, numbering) {
             
             var styleElement = element.first("w:pStyle");
             if (styleElement) {
-                properties.styleName = styleElement.attributes["w:val"];
+                var styleId = styleElement.attributes["w:val"];
+                properties.styleId = styleId;
+                if (styleId) {
+                    var style = styles.findParagraphStyleById(styleId);
+                    properties.styleName = style.name;
+                }
             }
             var alignElement = element.first("w:jc");
             if (alignElement) {
@@ -4912,7 +999,12 @@ function DocumentXmlReader(relationships, contentTypes, docxFile, numbering) {
             
             var styleElement = element.first("w:rStyle");
             if (styleElement) {
-                properties.styleName = styleElement.attributes["w:val"];
+                var styleId = styleElement.attributes["w:val"];
+                properties.styleId = styleId;
+                if (styleId) {
+                    var style = styles.findCharacterStyleById(styleId);
+                    properties.styleName = style.name;
+                }
             }
             properties.isBold = !!element.first("w:b");
             properties.isItalic = !!element.first("w:i");
@@ -4920,7 +1012,7 @@ function DocumentXmlReader(relationships, contentTypes, docxFile, numbering) {
             return new Result(properties);
         },
         "w:t": function(element) {
-            return new Result(new documents.Text(element.children[0].value));
+            return new Result(new documents.Text(element.text()));
         },
         "w:tab": function(element) {
             return new Result(new documents.Tab());
@@ -4935,6 +1027,12 @@ function DocumentXmlReader(relationships, contentTypes, docxFile, numbering) {
                     return children;
                 }
             });
+        },
+        "w:footnoteReference": function(element) {
+            var footnoteId = element.attributes["w:id"];
+            return new Result(new documents.FootnoteReference({
+                footnoteId: footnoteId
+            }));
         },
         
         "w:ins": readChildElements,
@@ -5010,7 +1108,7 @@ function joinZipPath(first, second) {
     return first + "/" + second;
 }
 
-},{"../documents":4,"../promises":15,"../results":16,"underscore":91}],7:[function(_dereq_,module,exports){
+},{"../documents":4,"../promises":18,"../results":19,"underscore":114}],7:[function(_dereq_,module,exports){
 exports.read = read;
 
 var promises = _dereq_("../promises");
@@ -5022,6 +1120,8 @@ var DocumentXmlReader = _dereq_("./document-xml-reader").DocumentXmlReader;
 var relationshipsReader = _dereq_("./relationships-reader");
 var contentTypesReader = _dereq_("./content-types-reader");
 var numberingXml = _dereq_("./numbering-xml");
+var stylesReader = _dereq_("./styles-reader");
+var footnotesReader = _dereq_("./footnotes-reader");
 
 
 function read(options) {
@@ -5031,9 +1131,18 @@ function read(options) {
             readRelationshipsFromZipFile(docxFile),
             readContentTypesFromZipFile(docxFile),
             readNumberingFromZipFile(docxFile),
-            readXmlFromZipFile(docxFile, "word/document.xml")
-        ]).spread(function(relationships, contentTypes, numbering, documentXml) {
-            var reader = new DocumentXmlReader(relationships, contentTypes, docxFile, numbering);
+            readStylesFromZipFile(docxFile),
+            readFootnotesFromZipFile(docxFile),
+            readXmlFromZipFile(docxFile, "word/document.xml"),
+        ]).spread(function(relationships, contentTypes, numbering, styles, footnotes, documentXml) {
+            var reader = new DocumentXmlReader({
+                relationships: relationships,
+                contentTypes: contentTypes,
+                docxFile: docxFile,
+                numbering: numbering,
+                styles: styles,
+                footnotes: footnotes
+            });
             return reader.convertXmlToDocument(documentXml);
         });
     });
@@ -5066,7 +1175,34 @@ var readNumberingFromZipFile = xmlFileReader({
     defaultValue: numberingXml.defaultNumbering
 });
 
-},{"../documents":4,"../promises":15,"../unzip":1,"./content-types-reader":5,"./document-xml-reader":6,"./numbering-xml":8,"./office-xml-reader":9,"./relationships-reader":10}],8:[function(_dereq_,module,exports){
+var readStylesFromZipFile = xmlFileReader({
+    filename: "word/styles.xml",
+    readElement: stylesReader.readStylesXml,
+    defaultValue: stylesReader.defaultStyles
+});
+
+var readFootnotesFromZipFile = xmlFileReader({
+    filename: "word/footnotes.xml",
+    readElement: footnotesReader.readFootnotesXml,
+    defaultValue: undefined
+});
+
+},{"../documents":4,"../promises":18,"../unzip":1,"./content-types-reader":5,"./document-xml-reader":6,"./footnotes-reader":8,"./numbering-xml":9,"./office-xml-reader":10,"./relationships-reader":11,"./styles-reader":12}],8:[function(_dereq_,module,exports){
+exports.readFootnotesXml = readFootnotesXml;
+
+var Footnotes = _dereq_("../documents").Footnotes;
+
+function readFootnotesXml(xml) {
+    return xml.root.getElementsByTagName("w:footnote").map(readFootnoteElement);
+}
+
+function readFootnoteElement(footnoteElement) {
+    var id = footnoteElement.attributes["w:id"];
+    var body = footnoteElement.children;
+    return {id: id, body: body};
+}
+
+},{"../documents":4}],9:[function(_dereq_,module,exports){
 exports.readNumberingXml = readNumberingXml;
 exports.Numbering = Numbering;
 exports.defaultNumbering = new Numbering({});
@@ -5122,7 +1258,7 @@ function readNums(xml, abstractNums) {
     return nums;
 }
 
-},{}],9:[function(_dereq_,module,exports){
+},{}],10:[function(_dereq_,module,exports){
 var promises = _dereq_("../promises");
 var xmlreader = _dereq_("../xmlreader");
 
@@ -5153,7 +1289,7 @@ function readXmlFromZipFile(docxFile, path) {
     }
 }
 
-},{"../promises":15,"../xmlreader":18}],10:[function(_dereq_,module,exports){
+},{"../promises":18,"../xmlreader":21}],11:[function(_dereq_,module,exports){
 exports.readRelationships = readRelationships;
 
 
@@ -5169,36 +1305,78 @@ function readRelationships(relationshipsXml) {
     return relationships;
 }
 
-},{}],11:[function(_dereq_,module,exports){
-var util = _dereq_("util");
+},{}],12:[function(_dereq_,module,exports){
+exports.readStylesXml = readStylesXml;
+exports.Styles = Styles;
+exports.defaultStyles = new Styles({}, {});
 
+function Styles(paragraphStyles, characterStyles) {
+    return {
+        findParagraphStyleById: function(styleId) {
+            return paragraphStyles[styleId];
+        },
+        findCharacterStyleById: function(styleId) {
+            return characterStyles[styleId];
+        }
+    };
+}
+
+function readStylesXml(xml) {
+    var paragraphStyles = {};
+    var characterStyles = {};
+    
+    var styles = {
+        "paragraph": paragraphStyles,
+        "character": characterStyles
+    };
+    
+    xml.root.getElementsByTagName("w:style").forEach(function(styleElement) {
+        var style = readStyleElement(styleElement);
+        var styleSet = styles[style.type];
+        if (styleSet) {
+            styleSet[style.styleId] = style;
+        }
+    });
+    
+    return new Styles(paragraphStyles, characterStyles);
+}
+
+function readStyleElement(styleElement) {
+    var type = styleElement.attributes["w:type"];
+    var styleId = styleElement.attributes["w:styleId"];
+    var name = styleElement.first("w:name").attributes["w:val"];
+    return {type: type, styleId: styleId, name: name};
+}
+
+},{}],13:[function(_dereq_,module,exports){
 var _ = _dereq_("underscore");
+
+var htmlWriter = _dereq_("./html-writer");
 
 exports.HtmlGenerator = HtmlGenerator;
 
 
-function HtmlGenerator() {
+function HtmlGenerator(options) {
     var stack = [];
-    var fragments = [];
+    var writer = htmlWriter.writer(options);
     
     function text(value) {
         if (value.length > 0) {
             writeAll();
-            fragments.push(escapeHtml(value))
+            writer.text(value);
         }
     }
     
     function asString() {
-        return fragments.join("");
+        return writer.asString();
     }
     
     function append(otherHtmlGenerator) {
-        if (otherHtmlGenerator._fragments.length > 0) {
+        var otherString = otherHtmlGenerator.asString();
+        if (otherString.length > 0) {
             writeAll();
         }
-        otherHtmlGenerator._fragments.forEach(function(fragment) {
-            fragments.push(fragment);
-        });
+        writer.append(otherString);
     }
     
     function satisfyPath(style) {
@@ -5231,7 +1409,7 @@ function HtmlGenerator() {
     function close() {
         var element = stack.pop();
         if (element.written) {
-            fragments.push(util.format("</%s>", element.tagName));
+            writer.close(element.tagName);
         }
     }
     
@@ -5249,19 +1427,11 @@ function HtmlGenerator() {
     
     function writeElement(element) {
         element.written = true;
-        var attributeString = generateAttributeString(element.attributes)
-        fragments.push(util.format("<%s%s>", element.tagName, attributeString));
+        writer.open(element.tagName, element.attributes);
     }
     
     function selfClosing(element) {
-        var attributeString = generateAttributeString(element.attributes)
-        fragments.push(util.format("<%s%s />", element.tagName, attributeString));
-    }
-    
-    function generateAttributeString(attributes) {
-        return _.map(attributes, function(value, key) {
-            return util.format(' %s="%s"', key, escapeHtml(value));
-        }).join("");
+        writer.selfClosing(element.tagName, element.attributes);
     }
     
     return {
@@ -5272,18 +1442,8 @@ function HtmlGenerator() {
         closeAll: closeAll,
         asString: asString,
         append: append,
-        selfClosing: selfClosing,
-        _fragments: fragments
+        selfClosing: selfClosing
     };
-}
-
-
-function escapeHtml(value) {
-    return value
-        .replace(/&/g, '&amp;')
-        .replace(/"/g, '&quot;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
 }
 
 function findIndex(array, predicate) {
@@ -5295,7 +1455,7 @@ function findIndex(array, predicate) {
     return -1;
 }
 
-},{"underscore":91,"util":75}],12:[function(_dereq_,module,exports){
+},{"./html-writer":15,"underscore":114}],14:[function(_dereq_,module,exports){
 var _ = _dereq_("underscore");
 
 exports.topLevelElement = topLevelElement;
@@ -5340,19 +1500,170 @@ function Element(tagName, attributes, options) {
     
 Element.prototype.matchesElement = function(element) {
     return this.tagNames[element.tagName] && _.isEqual(this.attributes || {}, element.attributes || {});
+};
+
+
+
+
+},{"underscore":114}],15:[function(_dereq_,module,exports){
+var util = _dereq_("util");
+var _ = _dereq_("underscore");
+
+exports.writer = writer;
+
+function writer(options) {
+    options = options || {};
+    if (options.prettyPrint) {
+        return prettyWriter();
+    } else {
+        return simpleWriter();
+    }
 }
 
 
+var indentedElements = {
+    div: true,
+    p: true,
+    ul: true
+};
 
 
-},{"underscore":91}],13:[function(_dereq_,module,exports){
+function prettyWriter() {
+    var indentationLevel = 0;
+    var indentation = "  ";
+    var stack = [];
+    var start = true;
+    var inText = false;
+    
+    var writer = simpleWriter();
+    
+    function open(tagName, attributes) {
+        indent();
+        stack.push(tagName);
+        writer.open(tagName, attributes);
+        if (indentedElements[tagName]) {
+            indentationLevel++;
+        }
+        start = false;
+    }
+    
+    function close(tagName) {
+        if (indentedElements[tagName]) {
+            indentationLevel--;
+        }
+        indent();
+        stack.pop();
+        writer.close(tagName);
+    }
+    
+    function text(value) {
+        startText();
+        writer.text(value.replace("\n", "\n" + indentation));
+    }
+    
+    function selfClosing(tagName, attributes) {
+        indent();
+        writer.selfClosing(tagName, attributes);
+    }
+    
+    function append(html) {
+        startText();
+        writer.append(html.replace("\n", "\n" + indentation));
+    }
+    
+    function insideIndentedElement() {
+        return stack.length === 0 || indentedElements[stack[stack.length - 1]];
+    }
+    
+    function startText() {
+        if (!inText) {
+            indent();
+            inText = true;
+        }
+    }
+    
+    function indent() {
+        inText = false;
+        if (!start && insideIndentedElement()) {
+            writer.append("\n");
+            for (var i = 0; i < indentationLevel; i++) {
+                writer.append(indentation);
+            }
+        }
+    }
+    
+    return {
+        asString: writer.asString,
+        open: open,
+        close: close,
+        text: text,
+        selfClosing: selfClosing,
+        append: append
+    };
+}
+
+
+function simpleWriter() {
+    var fragments = [];
+    
+    function open(tagName, attributes) {
+        var attributeString = generateAttributeString(attributes);
+        fragments.push(util.format("<%s%s>", tagName, attributeString));
+    }
+    
+    function close(tagName) {
+        fragments.push(util.format("</%s>", tagName));
+    }
+    
+    function selfClosing(tagName, attributes) {
+        var attributeString = generateAttributeString(attributes);
+        fragments.push(util.format("<%s%s />", tagName, attributeString));
+    }
+    
+    function generateAttributeString(attributes) {
+        return _.map(attributes, function(value, key) {
+            return util.format(' %s="%s"', key, escapeHtml(value));
+        }).join("");
+    }
+    
+    function text(value) {
+        fragments.push(escapeHtml(value));
+    }
+    
+    function append(html) {
+        fragments.push(html);
+    }
+    
+    function asString() {
+        return fragments.join("");
+    }
+    
+    return {
+        asString: asString,
+        open: open,
+        close: close,
+        text: text,
+        selfClosing: selfClosing,
+        append: append
+    };
+}
+
+
+function escapeHtml(value) {
+    return value
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+},{"underscore":114,"util":80}],16:[function(_dereq_,module,exports){
 var docxReader = _dereq_("./docx/docx-reader");
 var DocumentConverter = _dereq_("./document-to-html").DocumentConverter;
-var styleMapping = _dereq_("./style-reader").readStyle;
+var readStyle = _dereq_("./style-reader").readStyle;
 var readOptions = _dereq_("./options-reader").readOptions;
 
 exports.convertToHtml = convertToHtml;
-exports.styleMapping = styleMapping;
 
 function convertToHtml(input, options) {
     var fullOptions = readOptions(options);
@@ -5367,36 +1678,45 @@ function convertToHtml(input, options) {
 }
 
 function convertDocumentToHtml(documentResult, options) {
-    var documentConverter = new DocumentConverter(options);
+    var parsedOptions = Object.create(options);
+    parsedOptions.styleMap = (options.styleMap || []).map(readStyle);
+    var documentConverter = new DocumentConverter(parsedOptions);
     return documentResult.flatMapThen(function(document) {
         return documentConverter.convertToHtml(document);
     });
 }
 
-},{"./document-to-html":3,"./docx/docx-reader":7,"./options-reader":14,"./style-reader":17}],14:[function(_dereq_,module,exports){
+exports.styleMapping = function() {
+    throw new Error('Use a raw string instead of mammoth.styleMapping e.g. "p[style-naming=\'Title\'] => h1" instead of mammoth.styleMapping("p[style-naming=\'Title\'] => h1")');
+};
+
+},{"./document-to-html":3,"./docx/docx-reader":7,"./options-reader":17,"./style-reader":20}],17:[function(_dereq_,module,exports){
 exports.readOptions = readOptions;
 
 
 var _ = _dereq_("underscore");
-var style = _dereq_("./style-reader").readStyle;
 
 
 var standardOptions = exports._standardOptions = {
     styleMap: [
-        style("p.Heading1 => h1:fresh"),
-        style("p.Heading2 => h2:fresh"),
-        style("p.Heading3 => h3:fresh"),
-        style("p.Heading4 => h4:fresh"),
-        style("p:unordered-list(1) => ul > li:fresh"),
-        style("p:unordered-list(2) => ul|ol > li > ul > li:fresh"),
-        style("p:unordered-list(3) => ul|ol > li > ul|ol > li > ul > li:fresh"),
-        style("p:unordered-list(4) => ul|ol > li > ul|ol > li > ul|ol > li > ul > li:fresh"),
-        style("p:unordered-list(5) => ul|ol > li > ul|ol > li > ul|ol > li > ul|ol > li > ul > li:fresh"),
-        style("p:ordered-list(1) => ol > li:fresh"),
-        style("p:ordered-list(2) => ul|ol > li > ol > li:fresh"),
-        style("p:ordered-list(3) => ul|ol > li > ul|ol > li > ol > li:fresh"),
-        style("p:ordered-list(4) => ul|ol > li > ul|ol > li > ul|ol > li > ol > li:fresh"),
-        style("p:ordered-list(5) => ul|ol > li > ul|ol > li > ul|ol > li > ul|ol > li > ol > li:fresh")
+        "p.Heading1 => h1:fresh",
+        "p.Heading2 => h2:fresh",
+        "p.Heading3 => h3:fresh",
+        "p.Heading4 => h4:fresh",
+        "p[style-name='Heading 1'] => h1:fresh",
+        "p[style-name='Heading 2'] => h2:fresh",
+        "p[style-name='Heading 3'] => h3:fresh",
+        "p[style-name='Heading 4'] => h4:fresh",
+        "p:unordered-list(1) => ul > li:fresh",
+        "p:unordered-list(2) => ul|ol > li > ul > li:fresh",
+        "p:unordered-list(3) => ul|ol > li > ul|ol > li > ul > li:fresh",
+        "p:unordered-list(4) => ul|ol > li > ul|ol > li > ul|ol > li > ul > li:fresh",
+        "p:unordered-list(5) => ul|ol > li > ul|ol > li > ul|ol > li > ul|ol > li > ul > li:fresh",
+        "p:ordered-list(1) => ol > li:fresh",
+        "p:ordered-list(2) => ul|ol > li > ol > li:fresh",
+        "p:ordered-list(3) => ul|ol > li > ul|ol > li > ol > li:fresh",
+        "p:ordered-list(4) => ul|ol > li > ul|ol > li > ul|ol > li > ol > li:fresh",
+        "p:ordered-list(5) => ul|ol > li > ul|ol > li > ul|ol > li > ul|ol > li > ol > li:fresh"
     ],
     transformDocument: identity,
     includeDefaultStyleMap: true
@@ -5404,18 +1724,17 @@ var standardOptions = exports._standardOptions = {
 
 function readOptions(options) {
     options = options || {};
-    var fullOptions = {}
+    var fullOptions = {};
     _.extend(fullOptions, standardOptions, options);
     
-    fullOptions.styleMap = readStyleMap(options)
-        .concat(fullOptions.includeDefaultStyleMap ? standardOptions.styleMap : []);
+    fullOptions.styleMap = readStyleMap(options.styleMap, fullOptions);
     
     return fullOptions;
 }
 
-function readStyleMap(options) {
-    var customStyleMap = readCustomStyleMap(options.styleMap);
-    return customStyleMap;
+function readStyleMap(styleMap, options) {
+    var customStyleMap = readCustomStyleMap(styleMap);
+    return customStyleMap.concat(options.includeDefaultStyleMap ? standardOptions.styleMap : []);
 }
 
 function readCustomStyleMap(styleMap) {
@@ -5423,7 +1742,7 @@ function readCustomStyleMap(styleMap) {
         return [];
     } else if (_.isString(styleMap)) {
         return styleMap.split("\n").map(function(line) {
-            return style(line.trim());
+            return line.trim();
         });
     } else {
         return styleMap;
@@ -5435,7 +1754,7 @@ function identity(value) {
     return value;
 }
 
-},{"./style-reader":17,"underscore":91}],15:[function(_dereq_,module,exports){
+},{"underscore":114}],18:[function(_dereq_,module,exports){
 var bluebird = _dereq_("bluebird/js/main/promise")();
 var _ = _dereq_("underscore");
 
@@ -5443,6 +1762,8 @@ exports.defer = bluebird.defer;
 exports.when = bluebird.resolve;
 exports.resolve = bluebird.resolve;
 exports.all = bluebird.all;
+exports.reject = bluebird.reject;
+exports.promisify = bluebird.promisify;
 
 exports.nfcall = function(func) {
     var args = Array.prototype.slice.call(arguments, 1);
@@ -5452,7 +1773,7 @@ exports.nfcall = function(func) {
 
 bluebird.prototype.fail = bluebird.prototype.caught;
 
-},{"bluebird/js/main/promise":37,"underscore":91}],16:[function(_dereq_,module,exports){
+},{"bluebird/js/main/promise":41,"underscore":114}],19:[function(_dereq_,module,exports){
 var _ = _dereq_("underscore");
 
 
@@ -5467,6 +1788,11 @@ function Result(value, messages) {
 
 Result.prototype.map = function(func) {
     return new Result(func(this.value), this.messages);
+};
+
+Result.prototype.flatMap = function(func) {
+    var funcResult = func(this.value);
+    return new Result(funcResult.value, combineMessages([this, funcResult]));
 };
 
 Result.prototype.flatMapThen = function(func) {
@@ -5507,7 +1833,8 @@ function isSameMessage(first, second) {
     return first.type === second.type && first.message === second.message;
 }
 
-},{"underscore":91}],17:[function(_dereq_,module,exports){
+},{"underscore":114}],20:[function(_dereq_,module,exports){
+var _ = _dereq_("underscore");
 var lop = _dereq_("lop");
 var RegexTokeniser = lop.RegexTokeniser;
 
@@ -5520,10 +1847,10 @@ exports.readStyle = readStyle;
 
 
 function readStyle(string) {
-    return parseString(styleRule(), string);
+    return parseString(styleRule, string);
 }
 
-function styleRule() {
+function createStyleRule() {
     return lop.rules.sequence(
         lop.rules.sequence.capture(documentMatcherRule()),
         lop.rules.tokenOfType("whitespace"),
@@ -5562,12 +1889,38 @@ function documentMatcherRule() {
         runRule
     );
     
+    var styleIdRule = lop.rules.then(
+        classRule,
+        function(styleId) {
+            return {styleId: styleId};
+        }
+    );
+    
+    var stringRule = lop.rules.then(
+        lop.rules.tokenOfType("string"),
+        function(value) {
+            return value.substring(1, value.length - 1);
+        }
+    );
+    
+    var styleNameRule = lop.rules.then(
+        lop.rules.sequence(
+            lop.rules.tokenOfType("open-square-bracket"),
+            lop.rules.token("identifier", "style-name"),
+            lop.rules.tokenOfType("equals"),
+            lop.rules.sequence.capture(stringRule),
+            lop.rules.tokenOfType("close-square-bracket")
+        ).head(),
+        function(styleName) {
+            return {styleName: styleName};
+        }
+    );
+    
     
     var listTypeRule = lop.rules.firstOf("list type",
         identifierToConstant("ordered-list", {isOrdered: true}),
         identifierToConstant("unordered-list", {isOrdered: false})
     );
-    
     var listRule = sequence(
         lop.rules.tokenOfType("colon"),
         sequence.capture(listTypeRule),
@@ -5576,31 +1929,29 @@ function documentMatcherRule() {
         sequence.capture(integerRule),
         lop.rules.tokenOfType("close-paren")
     ).map(function(listType, levelNumber) {
-        return function(matcher) {
-            return matcher.list({
+        return {
+            list: {
                 isOrdered: listType.isOrdered,
                 levelIndex: levelNumber - 1
-            });
+            }
         };
     });
-    
-    var optionalListRule = lop.rules.then(
-        lop.rules.optional(listRule),
-        function(option) {
-            return option.valueOrElse(function() {
-                return function(matcher) {
-                    return matcher;
-                }
-            });
-        }
+    var matcherSuffix = lop.rules.firstOf("matcher suffix",
+        styleIdRule,
+        styleNameRule,
+        listRule
     );
+    var matcherSuffixes = lop.rules.zeroOrMore(matcherSuffix);
     
     return sequence(
         sequence.capture(elementTypeRule),
-        sequence.capture(lop.rules.optional(classRule)),
-        sequence.capture(optionalListRule)
-    ).map(function(createMatcher, styleName, applyList) {
-        return applyList(createMatcher(styleName.valueOrElse()));
+        sequence.capture(matcherSuffixes)
+    ).map(function(createMatcher, suffixes) {
+        var matcherOptions = {};
+        suffixes.forEach(function(suffix) {
+            _.extend(matcherOptions, suffix);
+        });
+        return createMatcher(matcherOptions);
     });
 }
 
@@ -5639,7 +1990,7 @@ function htmlPathRule() {
             attributes["class"] = classNames.join(" ");
         }
         if (fresh) {
-            options["fresh"] = true;
+            options.fresh = true;
         }
         return htmlPaths.element(tagName, attributes, options);
     });
@@ -5691,15 +2042,22 @@ function tokenise(string) {
         {name: "gt", regex: />/},
         {name: "whitespace", regex: /\s+/},
         {name: "arrow", regex: /=>/},
+        {name: "equals", regex: /=/},
         {name: "open-paren", regex: /\(/},
         {name: "close-paren", regex: /\)/},
+        {name: "open-square-bracket", regex: /\[/},
+        {name: "close-square-bracket", regex: /\]/},
+        {name: "string", regex: /'[^']*'/},
         {name: "integer", regex: /([0-9]+)/},
         {name: "choice", regex: /\|/}
     ]);
     return tokeniser.tokenise(string);
 }
 
-},{"./document-matchers":2,"./html-paths":12,"lop":77}],18:[function(_dereq_,module,exports){
+
+var styleRule = createStyleRule();
+
+},{"./document-matchers":2,"./html-paths":14,"lop":100,"underscore":114}],21:[function(_dereq_,module,exports){
 var promises = _dereq_("./promises");
 var sax = _dereq_("sax");
 var _ = _dereq_("underscore");
@@ -5727,7 +2085,7 @@ function read(xmlString, namespaceMap) {
         var element = new Element(mapName(node), attributes);
         currentElement.children.push(element);
         stack.push(currentElement);
-        currentElement = element
+        currentElement = element;
     };
     
     function mapName(node) {
@@ -5798,13 +2156,22 @@ Element.prototype.first = function(name) {
     return _.find(this.children, function(child) {
         return child.name == name;
     });
-}
+};
 
 Element.prototype.getElementsByTagName = function(name) {
     var elements = _.filter(this.children, function(child) {
         return child.name == name;
     });
     return toElementList(elements);
+};
+
+Element.prototype.text = function() {
+    if (this.children.length === 0) {
+        return "";
+    } else if (this.children.length !== 1 || this.children[0].type !== "text") {
+        throw new Error("Not implemented");
+    }
+    return this.children[0].value;
 };
 
 var elementListPrototype = {
@@ -5819,7 +2186,38 @@ function toElementList(array) {
     return _.extend(array, elementListPrototype);
 }
 
-},{"./promises":15,"sax":90,"underscore":91}],19:[function(_dereq_,module,exports){
+},{"./promises":18,"sax":113,"underscore":114}],22:[function(_dereq_,module,exports){
+(function (Buffer){
+var JSZip = _dereq_("jszip");
+
+var promises = _dereq_("./promises");
+
+exports.openArrayBuffer = openArrayBuffer;
+
+function openArrayBuffer(arrayBuffer) {
+    var zipFile = new JSZip(arrayBuffer);
+    function exists(name) {
+        return zipFile.file(name) !== null;
+    }
+    
+    function read(name, encoding) {
+        var array = zipFile.file(name).asUint8Array();
+        var buffer = new Buffer(array);
+        if (encoding) {
+            return promises.when(buffer.toString(encoding));
+        } else {
+            return promises.when(buffer);
+        }
+    }
+    return {
+        exists: exists,
+        read: read
+    };
+}
+
+
+}).call(this,_dereq_("buffer").Buffer)
+},{"./promises":18,"buffer":65,"jszip":88}],23:[function(_dereq_,module,exports){
 (function (process){
 /*global setImmediate: false, setTimeout: false, console: false */
 (function () {
@@ -6781,7 +3179,7 @@ function toElementList(array) {
 }());
 
 }).call(this,_dereq_("/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
-},{"/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":65}],20:[function(_dereq_,module,exports){
+},{"/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":70}],24:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -6837,7 +3235,7 @@ module.exports = function(Promise, Promise$_CreatePromiseArray, PromiseArray) {
 
 };
 
-},{"./some_promise_array.js":52}],21:[function(_dereq_,module,exports){
+},{"./some_promise_array.js":56}],25:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -6950,7 +3348,7 @@ Async.prototype._reset = function Async$_reset() {
 
 module.exports = new Async();
 
-},{"./global.js":33,"./queue.js":45,"./schedule.js":48,"./util.js":56}],22:[function(_dereq_,module,exports){
+},{"./global.js":37,"./queue.js":49,"./schedule.js":52,"./util.js":60}],26:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -7007,7 +3405,7 @@ module.exports = function(Promise) {
     };
 };
 
-},{}],23:[function(_dereq_,module,exports){
+},{}],27:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -7086,7 +3484,7 @@ module.exports = function(Promise, INTERNAL) {
     };
 };
 
-},{"./async.js":21,"./errors.js":27}],24:[function(_dereq_,module,exports){
+},{"./async.js":25,"./errors.js":31}],28:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -7325,7 +3723,7 @@ var captureStackTrace = (function stackDetection() {
 return CapturedTrace;
 };
 
-},{"./es5.js":29,"./util.js":56}],25:[function(_dereq_,module,exports){
+},{"./es5.js":33,"./util.js":60}],29:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -7420,7 +3818,7 @@ CatchFilter.prototype.doFilter = function CatchFilter$_doFilter(e) {
 return CatchFilter;
 };
 
-},{"./errors.js":27,"./es5.js":29,"./util.js":56}],26:[function(_dereq_,module,exports){
+},{"./errors.js":31,"./es5.js":33,"./util.js":60}],30:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -7505,7 +3903,7 @@ function Promise$thenThrow(reason) {
 };
 };
 
-},{"./util.js":56}],27:[function(_dereq_,module,exports){
+},{"./util.js":60}],31:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -7621,7 +4019,7 @@ module.exports = {
     canAttach: canAttach
 };
 
-},{"./es5.js":29,"./global.js":33,"./util.js":56}],28:[function(_dereq_,module,exports){
+},{"./es5.js":33,"./global.js":37,"./util.js":60}],32:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -7661,7 +4059,7 @@ function apiRejection(msg) {
 return apiRejection;
 };
 
-},{"./errors.js":27}],29:[function(_dereq_,module,exports){
+},{"./errors.js":31}],33:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -7752,7 +4150,7 @@ else {
     };
 }
 
-},{}],30:[function(_dereq_,module,exports){
+},{}],34:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -7807,7 +4205,7 @@ module.exports = function(Promise) {
     };
 };
 
-},{"./util.js":56}],31:[function(_dereq_,module,exports){
+},{"./util.js":60}],35:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -7941,7 +4339,7 @@ module.exports = function(Promise, NEXT_FILTER) {
     };
 };
 
-},{"./util.js":56}],32:[function(_dereq_,module,exports){
+},{"./util.js":60}],36:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -7999,7 +4397,7 @@ module.exports = function(Promise, apiRejection, INTERNAL) {
     };
 };
 
-},{"./errors.js":27,"./promise_spawn.js":41,"./util.js":56}],33:[function(_dereq_,module,exports){
+},{"./errors.js":31,"./promise_spawn.js":45,"./util.js":60}],37:[function(_dereq_,module,exports){
 (function (process,global){
 /**
  * Copyright (c) 2014 Petka Antonov
@@ -8045,7 +4443,7 @@ module.exports = (function(){
 })();
 
 }).call(this,_dereq_("/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":65}],34:[function(_dereq_,module,exports){
+},{"/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":70}],38:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -8174,7 +4572,7 @@ module.exports = function(
     };
 };
 
-},{}],35:[function(_dereq_,module,exports){
+},{}],39:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -8240,7 +4638,7 @@ module.exports = function(Promise) {
     };
 };
 
-},{"./async.js":21,"./util.js":56}],36:[function(_dereq_,module,exports){
+},{"./async.js":25,"./util.js":60}],40:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -8355,7 +4753,7 @@ module.exports = function(Promise, isPromiseArrayProxy) {
     };
 };
 
-},{"./async.js":21,"./errors.js":27,"./util.js":56}],37:[function(_dereq_,module,exports){
+},{"./async.js":25,"./errors.js":31,"./util.js":60}],41:[function(_dereq_,module,exports){
 (function (process){
 /**
  * Copyright (c) 2014 Petka Antonov
@@ -9526,7 +5924,7 @@ return Promise;
 };
 
 }).call(this,_dereq_("/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
-},{"./any.js":20,"./async.js":21,"./call_get.js":22,"./cancel.js":23,"./captured_trace.js":24,"./catch_filter.js":25,"./direct_resolve.js":26,"./errors.js":27,"./errors_api_rejection":28,"./filter.js":30,"./finally.js":31,"./generators.js":32,"./global.js":33,"./map.js":34,"./nodeify.js":35,"./progress.js":36,"./promise_array.js":38,"./promise_resolver.js":40,"./promisify.js":42,"./props.js":44,"./race.js":46,"./reduce.js":47,"./settle.js":49,"./some.js":51,"./synchronous_inspection.js":53,"./thenables.js":54,"./timers.js":55,"./util.js":56,"/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":65}],38:[function(_dereq_,module,exports){
+},{"./any.js":24,"./async.js":25,"./call_get.js":26,"./cancel.js":27,"./captured_trace.js":28,"./catch_filter.js":29,"./direct_resolve.js":30,"./errors.js":31,"./errors_api_rejection":32,"./filter.js":34,"./finally.js":35,"./generators.js":36,"./global.js":37,"./map.js":38,"./nodeify.js":39,"./progress.js":40,"./promise_array.js":42,"./promise_resolver.js":44,"./promisify.js":46,"./props.js":48,"./race.js":50,"./reduce.js":51,"./settle.js":53,"./some.js":55,"./synchronous_inspection.js":57,"./thenables.js":58,"./timers.js":59,"./util.js":60,"/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":70}],42:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -9761,7 +6159,7 @@ function PromiseArray$_promiseRejected(reason, index) {
 return PromiseArray;
 };
 
-},{"./async.js":21,"./errors.js":27,"./util.js":56}],39:[function(_dereq_,module,exports){
+},{"./async.js":25,"./errors.js":31,"./util.js":60}],43:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -9829,7 +6227,7 @@ PromiseInspection.prototype.error = function PromiseInspection$error() {
 
 module.exports = PromiseInspection;
 
-},{"./errors.js":27}],40:[function(_dereq_,module,exports){
+},{"./errors.js":31}],44:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -9983,7 +6381,7 @@ function PromiseResolver$_setCarriedStackTrace(trace) {
 
 module.exports = PromiseResolver;
 
-},{"./async.js":21,"./errors.js":27,"./es5.js":29,"./util.js":56}],41:[function(_dereq_,module,exports){
+},{"./async.js":25,"./errors.js":31,"./es5.js":33,"./util.js":60}],45:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -10116,7 +6514,7 @@ PromiseSpawn.addYieldHandler = function PromiseSpawn$AddYieldHandler(fn) {
 return PromiseSpawn;
 };
 
-},{"./errors.js":27,"./util.js":56}],42:[function(_dereq_,module,exports){
+},{"./errors.js":31,"./util.js":60}],46:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -10396,7 +6794,7 @@ Promise.promisifyAll = function Promise$PromisifyAll(target) {
 };
 
 
-},{"./es5.js":29,"./promise_resolver.js":40,"./util.js":56}],43:[function(_dereq_,module,exports){
+},{"./es5.js":33,"./promise_resolver.js":44,"./util.js":60}],47:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -10475,7 +6873,7 @@ PromiseArray.PropertiesPromiseArray = PropertiesPromiseArray;
 return PropertiesPromiseArray;
 };
 
-},{"./es5.js":29,"./util.js":56}],44:[function(_dereq_,module,exports){
+},{"./es5.js":33,"./util.js":60}],48:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -10542,7 +6940,7 @@ module.exports = function(Promise, PromiseArray) {
     };
 };
 
-},{"./errors_api_rejection":28,"./properties_promise_array.js":43,"./util.js":56}],45:[function(_dereq_,module,exports){
+},{"./errors_api_rejection":32,"./properties_promise_array.js":47,"./util.js":60}],49:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -10679,7 +7077,7 @@ Queue.prototype._resizeTo = function Queue$_resizeTo(capacity) {
 
 module.exports = Queue;
 
-},{}],46:[function(_dereq_,module,exports){
+},{}],50:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -10766,7 +7164,7 @@ module.exports = function(Promise, INTERNAL) {
 
 };
 
-},{"./errors_api_rejection.js":28,"./util.js":56}],47:[function(_dereq_,module,exports){
+},{"./errors_api_rejection.js":32,"./util.js":60}],51:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -10941,7 +7339,7 @@ module.exports = function(
     };
 };
 
-},{}],48:[function(_dereq_,module,exports){
+},{}],52:[function(_dereq_,module,exports){
 (function (process){
 /**
  * Copyright (c) 2014 Petka Antonov
@@ -11066,7 +7464,7 @@ else {
 module.exports = schedule;
 
 }).call(this,_dereq_("/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
-},{"./global.js":33,"/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":65}],49:[function(_dereq_,module,exports){
+},{"./global.js":37,"/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":70}],53:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -11117,7 +7515,7 @@ module.exports =
 
 };
 
-},{"./settled_promise_array.js":50}],50:[function(_dereq_,module,exports){
+},{"./settled_promise_array.js":54}],54:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -11179,7 +7577,7 @@ function SettledPromiseArray$_promiseRejected(reason, index) {
 return SettledPromiseArray;
 };
 
-},{"./promise_inspection.js":39,"./util.js":56}],51:[function(_dereq_,module,exports){
+},{"./promise_inspection.js":43,"./util.js":60}],55:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -11238,7 +7636,7 @@ function(Promise, Promise$_CreatePromiseArray, PromiseArray, apiRejection) {
 
 };
 
-},{"./some_promise_array.js":52}],52:[function(_dereq_,module,exports){
+},{"./some_promise_array.js":56}],56:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -11371,7 +7769,7 @@ function SomePromiseArray$_canPossiblyFulfill() {
 return SomePromiseArray;
 };
 
-},{"./errors.js":27,"./util.js":56}],53:[function(_dereq_,module,exports){
+},{"./errors.js":31,"./util.js":60}],57:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -11403,7 +7801,7 @@ module.exports = function(Promise) {
     };
 };
 
-},{"./promise_inspection.js":39}],54:[function(_dereq_,module,exports){
+},{"./promise_inspection.js":43}],58:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -11543,7 +7941,7 @@ module.exports = function(Promise, INTERNAL) {
     Promise._cast = Promise$_Cast;
 };
 
-},{"./errors.js":27,"./util.js":56}],55:[function(_dereq_,module,exports){
+},{"./errors.js":31,"./util.js":60}],59:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -11659,7 +8057,7 @@ module.exports = function(Promise, INTERNAL) {
 
 };
 
-},{"./errors.js":27,"./errors_api_rejection":28,"./global.js":33,"./util.js":56}],56:[function(_dereq_,module,exports){
+},{"./errors.js":31,"./errors_api_rejection":32,"./global.js":37,"./util.js":60}],60:[function(_dereq_,module,exports){
 /**
  * Copyright (c) 2014 Petka Antonov
  * 
@@ -11854,7 +8252,7 @@ var ret = {
 
 module.exports = ret;
 
-},{"./es5.js":29,"./global.js":33}],57:[function(_dereq_,module,exports){
+},{"./es5.js":33,"./global.js":37}],61:[function(_dereq_,module,exports){
 // http://wiki.commonjs.org/wiki/Unit_Testing/1.0
 //
 // THIS IS NOT TESTED NOR LIKELY TO WORK OUTSIDE V8!
@@ -12216,14 +8614,14 @@ var objectKeys = Object.keys || function (obj) {
   return keys;
 };
 
-},{"util/":59}],58:[function(_dereq_,module,exports){
+},{"util/":63}],62:[function(_dereq_,module,exports){
 module.exports = function isBuffer(arg) {
   return arg && typeof arg === 'object'
     && typeof arg.copy === 'function'
     && typeof arg.fill === 'function'
     && typeof arg.readUInt8 === 'function';
 }
-},{}],59:[function(_dereq_,module,exports){
+},{}],63:[function(_dereq_,module,exports){
 (function (process,global){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -12813,7 +9211,9 @@ function hasOwnProperty(obj, prop) {
 }
 
 }).call(this,_dereq_("/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./support/isBuffer":58,"/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":65,"inherits":64}],60:[function(_dereq_,module,exports){
+},{"./support/isBuffer":62,"/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":70,"inherits":69}],64:[function(_dereq_,module,exports){
+
+},{}],65:[function(_dereq_,module,exports){
 /**
  * The buffer module from node.js, for the browser.
  *
@@ -13925,7 +10325,7 @@ function assert (test, message) {
   if (!test) throw new Error(message || 'Failed assertion')
 }
 
-},{"base64-js":61,"ieee754":62}],61:[function(_dereq_,module,exports){
+},{"base64-js":66,"ieee754":67}],66:[function(_dereq_,module,exports){
 var lookup = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
 ;(function (exports) {
@@ -14048,7 +10448,7 @@ var lookup = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 	module.exports.fromByteArray = uint8ToBase64
 }())
 
-},{}],62:[function(_dereq_,module,exports){
+},{}],67:[function(_dereq_,module,exports){
 exports.read = function(buffer, offset, isLE, mLen, nBytes) {
   var e, m,
       eLen = nBytes * 8 - mLen - 1,
@@ -14134,7 +10534,7 @@ exports.write = function(buffer, value, offset, isLE, mLen, nBytes) {
   buffer[offset + i - d] |= s * 128;
 };
 
-},{}],63:[function(_dereq_,module,exports){
+},{}],68:[function(_dereq_,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -14436,7 +10836,7 @@ function isUndefined(arg) {
   return arg === void 0;
 }
 
-},{}],64:[function(_dereq_,module,exports){
+},{}],69:[function(_dereq_,module,exports){
 if (typeof Object.create === 'function') {
   // implementation from standard node.js 'util' module
   module.exports = function inherits(ctor, superCtor) {
@@ -14461,7 +10861,7 @@ if (typeof Object.create === 'function') {
   }
 }
 
-},{}],65:[function(_dereq_,module,exports){
+},{}],70:[function(_dereq_,module,exports){
 // shim for using process in browser
 
 var process = module.exports = {};
@@ -14516,7 +10916,7 @@ process.chdir = function (dir) {
     throw new Error('process.chdir is not supported');
 };
 
-},{}],66:[function(_dereq_,module,exports){
+},{}],71:[function(_dereq_,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -14590,7 +10990,7 @@ function onend() {
   });
 }
 
-},{"./readable.js":70,"./writable.js":72,"inherits":64,"process/browser.js":68}],67:[function(_dereq_,module,exports){
+},{"./readable.js":75,"./writable.js":77,"inherits":69,"process/browser.js":73}],72:[function(_dereq_,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -14719,9 +11119,9 @@ Stream.prototype.pipe = function(dest, options) {
   return dest;
 };
 
-},{"./duplex.js":66,"./passthrough.js":69,"./readable.js":70,"./transform.js":71,"./writable.js":72,"events":63,"inherits":64}],68:[function(_dereq_,module,exports){
-module.exports=_dereq_(65)
-},{}],69:[function(_dereq_,module,exports){
+},{"./duplex.js":71,"./passthrough.js":74,"./readable.js":75,"./transform.js":76,"./writable.js":77,"events":68,"inherits":69}],73:[function(_dereq_,module,exports){
+module.exports=_dereq_(70)
+},{}],74:[function(_dereq_,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -14764,7 +11164,7 @@ PassThrough.prototype._transform = function(chunk, encoding, cb) {
   cb(null, chunk);
 };
 
-},{"./transform.js":71,"inherits":64}],70:[function(_dereq_,module,exports){
+},{"./transform.js":76,"inherits":69}],75:[function(_dereq_,module,exports){
 (function (process){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -15701,7 +12101,7 @@ function indexOf (xs, x) {
 }
 
 }).call(this,_dereq_("/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
-},{"./index.js":67,"/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":65,"buffer":60,"events":63,"inherits":64,"process/browser.js":68,"string_decoder":73}],71:[function(_dereq_,module,exports){
+},{"./index.js":72,"/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":70,"buffer":65,"events":68,"inherits":69,"process/browser.js":73,"string_decoder":78}],76:[function(_dereq_,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -15907,7 +12307,7 @@ function done(stream, er) {
   return stream.push(null);
 }
 
-},{"./duplex.js":66,"inherits":64}],72:[function(_dereq_,module,exports){
+},{"./duplex.js":71,"inherits":69}],77:[function(_dereq_,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -16295,7 +12695,7 @@ function endWritable(stream, state, cb) {
   state.ended = true;
 }
 
-},{"./index.js":67,"buffer":60,"inherits":64,"process/browser.js":68}],73:[function(_dereq_,module,exports){
+},{"./index.js":72,"buffer":65,"inherits":69,"process/browser.js":73}],78:[function(_dereq_,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -16488,11 +12888,11 @@ function base64DetectIncompleteChar(buffer) {
   return incomplete;
 }
 
-},{"buffer":60}],74:[function(_dereq_,module,exports){
-module.exports=_dereq_(58)
-},{}],75:[function(_dereq_,module,exports){
-module.exports=_dereq_(59)
-},{"./support/isBuffer":74,"/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":65,"inherits":64}],76:[function(_dereq_,module,exports){
+},{"buffer":65}],79:[function(_dereq_,module,exports){
+module.exports=_dereq_(62)
+},{}],80:[function(_dereq_,module,exports){
+module.exports=_dereq_(63)
+},{"./support/isBuffer":79,"/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":70,"inherits":69}],81:[function(_dereq_,module,exports){
 var util = _dereq_("util");
 var assert = _dereq_("assert");
 
@@ -16749,7 +13149,2255 @@ exports.any = new Matcher({
     }
 });
 
-},{"assert":57,"underscore":91,"util":75}],77:[function(_dereq_,module,exports){
+},{"assert":61,"underscore":114,"util":80}],82:[function(_dereq_,module,exports){
+'use strict';
+// private property
+var _keyStr = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+
+
+// public method for encoding
+exports.encode = function(input, utf8) {
+    var output = "";
+    var chr1, chr2, chr3, enc1, enc2, enc3, enc4;
+    var i = 0;
+
+    while (i < input.length) {
+
+        chr1 = input.charCodeAt(i++);
+        chr2 = input.charCodeAt(i++);
+        chr3 = input.charCodeAt(i++);
+
+        enc1 = chr1 >> 2;
+        enc2 = ((chr1 & 3) << 4) | (chr2 >> 4);
+        enc3 = ((chr2 & 15) << 2) | (chr3 >> 6);
+        enc4 = chr3 & 63;
+
+        if (isNaN(chr2)) {
+            enc3 = enc4 = 64;
+        }
+        else if (isNaN(chr3)) {
+            enc4 = 64;
+        }
+
+        output = output + _keyStr.charAt(enc1) + _keyStr.charAt(enc2) + _keyStr.charAt(enc3) + _keyStr.charAt(enc4);
+
+    }
+
+    return output;
+};
+
+// public method for decoding
+exports.decode = function(input, utf8) {
+    var output = "";
+    var chr1, chr2, chr3;
+    var enc1, enc2, enc3, enc4;
+    var i = 0;
+
+    input = input.replace(/[^A-Za-z0-9\+\/\=]/g, "");
+
+    while (i < input.length) {
+
+        enc1 = _keyStr.indexOf(input.charAt(i++));
+        enc2 = _keyStr.indexOf(input.charAt(i++));
+        enc3 = _keyStr.indexOf(input.charAt(i++));
+        enc4 = _keyStr.indexOf(input.charAt(i++));
+
+        chr1 = (enc1 << 2) | (enc2 >> 4);
+        chr2 = ((enc2 & 15) << 4) | (enc3 >> 2);
+        chr3 = ((enc3 & 3) << 6) | enc4;
+
+        output = output + String.fromCharCode(chr1);
+
+        if (enc3 != 64) {
+            output = output + String.fromCharCode(chr2);
+        }
+        if (enc4 != 64) {
+            output = output + String.fromCharCode(chr3);
+        }
+
+    }
+
+    return output;
+
+};
+
+},{}],83:[function(_dereq_,module,exports){
+'use strict';
+function CompressedObject() {
+    this.compressedSize = 0;
+    this.uncompressedSize = 0;
+    this.crc32 = 0;
+    this.compressionMethod = null;
+    this.compressedContent = null;
+}
+
+CompressedObject.prototype = {
+    /**
+     * Return the decompressed content in an unspecified format.
+     * The format will depend on the decompressor.
+     * @return {Object} the decompressed content.
+     */
+    getContent: function() {
+        return null; // see implementation
+    },
+    /**
+     * Return the compressed content in an unspecified format.
+     * The format will depend on the compressed conten source.
+     * @return {Object} the compressed content.
+     */
+    getCompressedContent: function() {
+        return null; // see implementation
+    }
+};
+module.exports = CompressedObject;
+
+},{}],84:[function(_dereq_,module,exports){
+'use strict';
+exports.STORE = {
+    magic: "\x00\x00",
+    compress: function(content) {
+        return content; // no compression
+    },
+    uncompress: function(content) {
+        return content; // no compression
+    },
+    compressInputType: null,
+    uncompressInputType: null
+};
+exports.DEFLATE = _dereq_('./flate');
+
+},{"./flate":87}],85:[function(_dereq_,module,exports){
+'use strict';
+var utils = _dereq_('./utils');
+
+function DataReader(data) {
+    this.data = null; // type : see implementation
+    this.length = 0;
+    this.index = 0;
+}
+DataReader.prototype = {
+    /**
+     * Check that the offset will not go too far.
+     * @param {string} offset the additional offset to check.
+     * @throws {Error} an Error if the offset is out of bounds.
+     */
+    checkOffset: function(offset) {
+        this.checkIndex(this.index + offset);
+    },
+    /**
+     * Check that the specifed index will not be too far.
+     * @param {string} newIndex the index to check.
+     * @throws {Error} an Error if the index is out of bounds.
+     */
+    checkIndex: function(newIndex) {
+        if (this.length < newIndex || newIndex < 0) {
+            throw new Error("End of data reached (data length = " + this.length + ", asked index = " + (newIndex) + "). Corrupted zip ?");
+        }
+    },
+    /**
+     * Change the index.
+     * @param {number} newIndex The new index.
+     * @throws {Error} if the new index is out of the data.
+     */
+    setIndex: function(newIndex) {
+        this.checkIndex(newIndex);
+        this.index = newIndex;
+    },
+    /**
+     * Skip the next n bytes.
+     * @param {number} n the number of bytes to skip.
+     * @throws {Error} if the new index is out of the data.
+     */
+    skip: function(n) {
+        this.setIndex(this.index + n);
+    },
+    /**
+     * Get the byte at the specified index.
+     * @param {number} i the index to use.
+     * @return {number} a byte.
+     */
+    byteAt: function(i) {
+        // see implementations
+    },
+    /**
+     * Get the next number with a given byte size.
+     * @param {number} size the number of bytes to read.
+     * @return {number} the corresponding number.
+     */
+    readInt: function(size) {
+        var result = 0,
+            i;
+        this.checkOffset(size);
+        for (i = this.index + size - 1; i >= this.index; i--) {
+            result = (result << 8) + this.byteAt(i);
+        }
+        this.index += size;
+        return result;
+    },
+    /**
+     * Get the next string with a given byte size.
+     * @param {number} size the number of bytes to read.
+     * @return {string} the corresponding string.
+     */
+    readString: function(size) {
+        return utils.transformTo("string", this.readData(size));
+    },
+    /**
+     * Get raw data without conversion, <size> bytes.
+     * @param {number} size the number of bytes to read.
+     * @return {Object} the raw data, implementation specific.
+     */
+    readData: function(size) {
+        // see implementations
+    },
+    /**
+     * Find the last occurence of a zip signature (4 bytes).
+     * @param {string} sig the signature to find.
+     * @return {number} the index of the last occurence, -1 if not found.
+     */
+    lastIndexOfSignature: function(sig) {
+        // see implementations
+    },
+    /**
+     * Get the next date.
+     * @return {Date} the date.
+     */
+    readDate: function() {
+        var dostime = this.readInt(4);
+        return new Date(
+        ((dostime >> 25) & 0x7f) + 1980, // year
+        ((dostime >> 21) & 0x0f) - 1, // month
+        (dostime >> 16) & 0x1f, // day
+        (dostime >> 11) & 0x1f, // hour
+        (dostime >> 5) & 0x3f, // minute
+        (dostime & 0x1f) << 1); // second
+    }
+};
+module.exports = DataReader;
+
+},{"./utils":95}],86:[function(_dereq_,module,exports){
+'use strict';
+exports.base64 = false;
+exports.binary = false;
+exports.dir = false;
+exports.date = null;
+exports.compression = null;
+
+},{}],87:[function(_dereq_,module,exports){
+'use strict';
+var USE_TYPEDARRAY = (typeof Uint8Array !== 'undefined') && (typeof Uint16Array !== 'undefined') && (typeof Uint32Array !== 'undefined');
+
+var  ZlibDeflate = _dereq_('zlibjs/bin/rawdeflate.min').Zlib;
+var  ZlibInflate = _dereq_('zlibjs/bin/rawinflate.min').Zlib;
+exports.uncompressInputType = USE_TYPEDARRAY ? "uint8array" : "array";
+exports.compressInputType = USE_TYPEDARRAY ? "uint8array" : "array";
+
+exports.magic = "\x08\x00";
+exports.compress = function(input) {
+    var deflate = new ZlibDeflate.RawDeflate(input);
+    return deflate.compress();
+};
+exports.uncompress =  function(input) {
+    var inflate = new ZlibInflate.RawInflate(input);
+    return inflate.decompress();
+};
+
+},{"zlibjs/bin/rawdeflate.min":98,"zlibjs/bin/rawinflate.min":99}],88:[function(_dereq_,module,exports){
+'use strict';
+/**
+Usage:
+   zip = new JSZip();
+   zip.file("hello.txt", "Hello, World!").file("tempfile", "nothing");
+   zip.folder("images").file("smile.gif", base64Data, {base64: true});
+   zip.file("Xmas.txt", "Ho ho ho !", {date : new Date("December 25, 2007 00:00:01")});
+   zip.remove("tempfile");
+
+   base64zip = zip.generate();
+
+**/
+
+/**
+ * Representation a of zip file in js
+ * @constructor
+ * @param {String=|ArrayBuffer=|Uint8Array=} data the data to load, if any (optional).
+ * @param {Object=} options the options for creating this objects (optional).
+ */
+function JSZip(data, options) {
+    // if this constructor is used without `new`, it adds `new` before itself:
+    if(!(this instanceof JSZip)) return new JSZip(data, options);
+    
+    // object containing the files :
+    // {
+    //   "folder/" : {...},
+    //   "folder/data.txt" : {...}
+    // }
+    this.files = {};
+
+    // Where we are in the hierarchy
+    this.root = "";
+    if (data) {
+        this.load(data, options);
+    }
+    this.clone = function() {
+        var newObj = new JSZip();
+        for (var i in this) {
+            if (typeof this[i] !== "function") {
+                newObj[i] = this[i];
+            }
+        }
+        return newObj;
+    };
+}
+JSZip.prototype = _dereq_('./object');
+JSZip.prototype.load = _dereq_('./load');
+JSZip.support = _dereq_('./support');
+JSZip.defaults = _dereq_('./defaults');
+JSZip.utils = _dereq_('./utils');
+JSZip.base64 = _dereq_('./base64');
+JSZip.compressions = _dereq_('./compressions');
+module.exports = JSZip;
+
+},{"./base64":82,"./compressions":84,"./defaults":86,"./load":89,"./object":90,"./support":93,"./utils":95}],89:[function(_dereq_,module,exports){
+'use strict';
+var base64 = _dereq_('./base64');
+var ZipEntries = _dereq_('./zipEntries');
+module.exports = function(data, options) {
+    var files, zipEntries, i, input;
+    options = options || {};
+    if (options.base64) {
+        data = base64.decode(data);
+    }
+
+    zipEntries = new ZipEntries(data, options);
+    files = zipEntries.files;
+    for (i = 0; i < files.length; i++) {
+        input = files[i];
+        this.file(input.fileName, input.decompressed, {
+            binary: true,
+            optimizedBinaryString: true,
+            date: input.date,
+            dir: input.dir
+        });
+    }
+
+    return this;
+};
+
+},{"./base64":82,"./zipEntries":96}],90:[function(_dereq_,module,exports){
+'use strict';
+var support = _dereq_('./support');
+var utils = _dereq_('./utils');
+var signature = _dereq_('./signature');
+var defaults = _dereq_('./defaults');
+var base64 = _dereq_('./base64');
+var compressions = _dereq_('./compressions');
+var CompressedObject = _dereq_('./compressedObject');
+var nodeBuffer = _dereq_('./nodeBuffer');
+/**
+ * Returns the raw data of a ZipObject, decompress the content if necessary.
+ * @param {ZipObject} file the file to use.
+ * @return {String|ArrayBuffer|Uint8Array|Buffer} the data.
+ */
+
+var textEncoder, textDecoder;
+if (
+    support.uint8array &&
+    typeof TextEncoder === "function" &&
+    typeof TextDecoder === "function"
+) {
+    textEncoder = new TextEncoder("utf-8");
+    textDecoder = new TextDecoder("utf-8");
+}
+
+var getRawData = function(file) {
+    if (file._data instanceof CompressedObject) {
+        file._data = file._data.getContent();
+        file.options.binary = true;
+        file.options.base64 = false;
+
+        if (utils.getTypeOf(file._data) === "uint8array") {
+            var copy = file._data;
+            // when reading an arraybuffer, the CompressedObject mechanism will keep it and subarray() a Uint8Array.
+            // if we request a file in the same format, we might get the same Uint8Array or its ArrayBuffer (the original zip file).
+            file._data = new Uint8Array(copy.length);
+            // with an empty Uint8Array, Opera fails with a "Offset larger than array size"
+            if (copy.length !== 0) {
+                file._data.set(copy, 0);
+            }
+        }
+    }
+    return file._data;
+};
+
+/**
+ * Returns the data of a ZipObject in a binary form. If the content is an unicode string, encode it.
+ * @param {ZipObject} file the file to use.
+ * @return {String|ArrayBuffer|Uint8Array|Buffer} the data.
+ */
+var getBinaryData = function(file) {
+    var result = getRawData(file),
+        type = utils.getTypeOf(result);
+    if (type === "string") {
+        if (!file.options.binary) {
+            // unicode text !
+            // unicode string => binary string is a painful process, check if we can avoid it.
+            if (textEncoder) {
+                return textEncoder.encode(result);
+            }
+            if (support.nodebuffer) {
+                return nodeBuffer(result, "utf-8");
+            }
+        }
+        return file.asBinary();
+    }
+    return result;
+};
+
+/**
+ * Transform this._data into a string.
+ * @param {function} filter a function String -> String, applied if not null on the result.
+ * @return {String} the string representing this._data.
+ */
+var dataToString = function(asUTF8) {
+    var result = getRawData(this);
+    if (result === null || typeof result === "undefined") {
+        return "";
+    }
+    // if the data is a base64 string, we decode it before checking the encoding !
+    if (this.options.base64) {
+        result = base64.decode(result);
+    }
+    if (asUTF8 && this.options.binary) {
+        // JSZip.prototype.utf8decode supports arrays as input
+        // skip to array => string step, utf8decode will do it.
+        result = out.utf8decode(result);
+    }
+    else {
+        // no utf8 transformation, do the array => string step.
+        result = utils.transformTo("string", result);
+    }
+
+    if (!asUTF8 && !this.options.binary) {
+        result = out.utf8encode(result);
+    }
+    return result;
+};
+/**
+ * A simple object representing a file in the zip file.
+ * @constructor
+ * @param {string} name the name of the file
+ * @param {String|ArrayBuffer|Uint8Array|Buffer} data the data
+ * @param {Object} options the options of the file
+ */
+var ZipObject = function(name, data, options) {
+    this.name = name;
+    this._data = data;
+    this.options = options;
+};
+
+ZipObject.prototype = {
+    /**
+     * Return the content as UTF8 string.
+     * @return {string} the UTF8 string.
+     */
+    asText: function() {
+        return dataToString.call(this, true);
+    },
+    /**
+     * Returns the binary content.
+     * @return {string} the content as binary.
+     */
+    asBinary: function() {
+        return dataToString.call(this, false);
+    },
+    /**
+     * Returns the content as a nodejs Buffer.
+     * @return {Buffer} the content as a Buffer.
+     */
+    asNodeBuffer: function() {
+        var result = getBinaryData(this);
+        return utils.transformTo("nodebuffer", result);
+    },
+    /**
+     * Returns the content as an Uint8Array.
+     * @return {Uint8Array} the content as an Uint8Array.
+     */
+    asUint8Array: function() {
+        var result = getBinaryData(this);
+        return utils.transformTo("uint8array", result);
+    },
+    /**
+     * Returns the content as an ArrayBuffer.
+     * @return {ArrayBuffer} the content as an ArrayBufer.
+     */
+    asArrayBuffer: function() {
+        return this.asUint8Array().buffer;
+    }
+};
+
+/**
+ * Transform an integer into a string in hexadecimal.
+ * @private
+ * @param {number} dec the number to convert.
+ * @param {number} bytes the number of bytes to generate.
+ * @returns {string} the result.
+ */
+var decToHex = function(dec, bytes) {
+    var hex = "",
+        i;
+    for (i = 0; i < bytes; i++) {
+        hex += String.fromCharCode(dec & 0xff);
+        dec = dec >>> 8;
+    }
+    return hex;
+};
+
+/**
+ * Merge the objects passed as parameters into a new one.
+ * @private
+ * @param {...Object} var_args All objects to merge.
+ * @return {Object} a new object with the data of the others.
+ */
+var extend = function() {
+    var result = {}, i, attr;
+    for (i = 0; i < arguments.length; i++) { // arguments is not enumerable in some browsers
+        for (attr in arguments[i]) {
+            if (arguments[i].hasOwnProperty(attr) && typeof result[attr] === "undefined") {
+                result[attr] = arguments[i][attr];
+            }
+        }
+    }
+    return result;
+};
+
+/**
+ * Transforms the (incomplete) options from the user into the complete
+ * set of options to create a file.
+ * @private
+ * @param {Object} o the options from the user.
+ * @return {Object} the complete set of options.
+ */
+var prepareFileAttrs = function(o) {
+    o = o || {};
+    if (o.base64 === true && (o.binary === null || o.binary === undefined)) {
+        o.binary = true;
+    }
+    o = extend(o, defaults);
+    o.date = o.date || new Date();
+    if (o.compression !== null) o.compression = o.compression.toUpperCase();
+
+    return o;
+};
+
+/**
+ * Add a file in the current folder.
+ * @private
+ * @param {string} name the name of the file
+ * @param {String|ArrayBuffer|Uint8Array|Buffer} data the data of the file
+ * @param {Object} o the options of the file
+ * @return {Object} the new file.
+ */
+var fileAdd = function(name, data, o) {
+    // be sure sub folders exist
+    var parent = parentFolder(name),
+        dataType = utils.getTypeOf(data);
+    if (parent) {
+        folderAdd.call(this, parent);
+    }
+
+    o = prepareFileAttrs(o);
+
+    if (o.dir || data === null || typeof data === "undefined") {
+        o.base64 = false;
+        o.binary = false;
+        data = null;
+    }
+    else if (dataType === "string") {
+        if (o.binary && !o.base64) {
+            // optimizedBinaryString == true means that the file has already been filtered with a 0xFF mask
+            if (o.optimizedBinaryString !== true) {
+                // this is a string, not in a base64 format.
+                // Be sure that this is a correct "binary string"
+                data = utils.string2binary(data);
+            }
+        }
+    }
+    else { // arraybuffer, uint8array, ...
+        o.base64 = false;
+        o.binary = true;
+
+        if (!dataType && !(data instanceof CompressedObject)) {
+            throw new Error("The data of '" + name + "' is in an unsupported format !");
+        }
+
+        // special case : it's way easier to work with Uint8Array than with ArrayBuffer
+        if (dataType === "arraybuffer") {
+            data = utils.transformTo("uint8array", data);
+        }
+    }
+
+    var object = new ZipObject(name, data, o);
+    this.files[name] = object;
+    return object;
+};
+
+
+/**
+ * Find the parent folder of the path.
+ * @private
+ * @param {string} path the path to use
+ * @return {string} the parent folder, or ""
+ */
+var parentFolder = function(path) {
+    if (path.slice(-1) == '/') {
+        path = path.substring(0, path.length - 1);
+    }
+    var lastSlash = path.lastIndexOf('/');
+    return (lastSlash > 0) ? path.substring(0, lastSlash) : "";
+};
+
+/**
+ * Add a (sub) folder in the current folder.
+ * @private
+ * @param {string} name the folder's name
+ * @return {Object} the new folder.
+ */
+var folderAdd = function(name) {
+    // Check the name ends with a /
+    if (name.slice(-1) != "/") {
+        name += "/"; // IE doesn't like substr(-1)
+    }
+
+    // Does this folder already exist?
+    if (!this.files[name]) {
+        fileAdd.call(this, name, null, {
+            dir: true
+        });
+    }
+    return this.files[name];
+};
+
+/**
+ * Generate a JSZip.CompressedObject for a given zipOject.
+ * @param {ZipObject} file the object to read.
+ * @param {JSZip.compression} compression the compression to use.
+ * @return {JSZip.CompressedObject} the compressed result.
+ */
+var generateCompressedObjectFrom = function(file, compression) {
+    var result = new CompressedObject(),
+        content;
+
+    // the data has not been decompressed, we might reuse things !
+    if (file._data instanceof CompressedObject) {
+        result.uncompressedSize = file._data.uncompressedSize;
+        result.crc32 = file._data.crc32;
+
+        if (result.uncompressedSize === 0 || file.options.dir) {
+            compression = compressions['STORE'];
+            result.compressedContent = "";
+            result.crc32 = 0;
+        }
+        else if (file._data.compressionMethod === compression.magic) {
+            result.compressedContent = file._data.getCompressedContent();
+        }
+        else {
+            content = file._data.getContent();
+            // need to decompress / recompress
+            result.compressedContent = compression.compress(utils.transformTo(compression.compressInputType, content));
+        }
+    }
+    else {
+        // have uncompressed data
+        content = getBinaryData(file);
+        if (!content || content.length === 0 || file.options.dir) {
+            compression = compressions['STORE'];
+            content = "";
+        }
+        result.uncompressedSize = content.length;
+        result.crc32 = this.crc32(content);
+        result.compressedContent = compression.compress(utils.transformTo(compression.compressInputType, content));
+    }
+
+    result.compressedSize = result.compressedContent.length;
+    result.compressionMethod = compression.magic;
+
+    return result;
+};
+
+/**
+ * Generate the various parts used in the construction of the final zip file.
+ * @param {string} name the file name.
+ * @param {ZipObject} file the file content.
+ * @param {JSZip.CompressedObject} compressedObject the compressed object.
+ * @param {number} offset the current offset from the start of the zip file.
+ * @return {object} the zip parts.
+ */
+var generateZipParts = function(name, file, compressedObject, offset) {
+    var data = compressedObject.compressedContent,
+        utfEncodedFileName = this.utf8encode(file.name),
+        useUTF8 = utfEncodedFileName !== file.name,
+        o = file.options,
+        dosTime,
+        dosDate,
+        extraFields = "",
+        unicodePathExtraField = "";
+
+    // date
+    // @see http://www.delorie.com/djgpp/doc/rbinter/it/52/13.html
+    // @see http://www.delorie.com/djgpp/doc/rbinter/it/65/16.html
+    // @see http://www.delorie.com/djgpp/doc/rbinter/it/66/16.html
+
+    dosTime = o.date.getHours();
+    dosTime = dosTime << 6;
+    dosTime = dosTime | o.date.getMinutes();
+    dosTime = dosTime << 5;
+    dosTime = dosTime | o.date.getSeconds() / 2;
+
+    dosDate = o.date.getFullYear() - 1980;
+    dosDate = dosDate << 4;
+    dosDate = dosDate | (o.date.getMonth() + 1);
+    dosDate = dosDate << 5;
+    dosDate = dosDate | o.date.getDate();
+
+    if (useUTF8) {
+        // set the unicode path extra field. unzip needs at least one extra
+        // field to correctly handle unicode path, so using the path is as good
+        // as any other information. This could improve the situation with
+        // other archive managers too.
+        // This field is usually used without the utf8 flag, with a non
+        // unicode path in the header (winrar, winzip). This helps (a bit)
+        // with the messy Windows' default compressed folders feature but
+        // breaks on p7zip which doesn't seek the unicode path extra field.
+        // So for now, UTF-8 everywhere !
+        unicodePathExtraField =
+            // Version
+            decToHex(1, 1) +
+            // NameCRC32
+            decToHex(this.crc32(utfEncodedFileName), 4) +
+            // UnicodeName
+            utfEncodedFileName;
+
+        extraFields +=
+            // Info-ZIP Unicode Path Extra Field
+            "\x75\x70" +
+            // size
+            decToHex(unicodePathExtraField.length, 2) +
+            // content
+            unicodePathExtraField;
+    }
+
+    var header = "";
+
+    // version needed to extract
+    header += "\x0A\x00";
+    // general purpose bit flag
+    // set bit 11 if utf8
+    header += useUTF8 ? "\x00\x08" : "\x00\x00";
+    // compression method
+    header += compressedObject.compressionMethod;
+    // last mod file time
+    header += decToHex(dosTime, 2);
+    // last mod file date
+    header += decToHex(dosDate, 2);
+    // crc-32
+    header += decToHex(compressedObject.crc32, 4);
+    // compressed size
+    header += decToHex(compressedObject.compressedSize, 4);
+    // uncompressed size
+    header += decToHex(compressedObject.uncompressedSize, 4);
+    // file name length
+    header += decToHex(utfEncodedFileName.length, 2);
+    // extra field length
+    header += decToHex(extraFields.length, 2);
+
+
+    var fileRecord = signature.LOCAL_FILE_HEADER + header + utfEncodedFileName + extraFields;
+
+    var dirRecord = signature.CENTRAL_FILE_HEADER +
+    // version made by (00: DOS)
+    "\x14\x00" +
+    // file header (common to file and central directory)
+    header +
+    // file comment length
+    "\x00\x00" +
+    // disk number start
+    "\x00\x00" +
+    // internal file attributes TODO
+    "\x00\x00" +
+    // external file attributes
+    (file.options.dir === true ? "\x10\x00\x00\x00" : "\x00\x00\x00\x00") +
+    // relative offset of local header
+    decToHex(offset, 4) +
+    // file name
+    utfEncodedFileName +
+    // extra field
+    extraFields;
+
+
+    return {
+        fileRecord: fileRecord,
+        dirRecord: dirRecord,
+        compressedObject: compressedObject
+    };
+};
+
+/**
+ * An object to write any content to a string.
+ * @constructor
+ */
+var StringWriter = function() {
+    this.data = [];
+};
+StringWriter.prototype = {
+    /**
+     * Append any content to the current string.
+     * @param {Object} input the content to add.
+     */
+    append: function(input) {
+        input = utils.transformTo("string", input);
+        this.data.push(input);
+    },
+    /**
+     * Finalize the construction an return the result.
+     * @return {string} the generated string.
+     */
+    finalize: function() {
+        return this.data.join("");
+    }
+};
+/**
+ * An object to write any content to an Uint8Array.
+ * @constructor
+ * @param {number} length The length of the array.
+ */
+var Uint8ArrayWriter = function(length) {
+    this.data = new Uint8Array(length);
+    this.index = 0;
+};
+Uint8ArrayWriter.prototype = {
+    /**
+     * Append any content to the current array.
+     * @param {Object} input the content to add.
+     */
+    append: function(input) {
+        if (input.length !== 0) {
+            // with an empty Uint8Array, Opera fails with a "Offset larger than array size"
+            input = utils.transformTo("uint8array", input);
+            this.data.set(input, this.index);
+            this.index += input.length;
+        }
+    },
+    /**
+     * Finalize the construction an return the result.
+     * @return {Uint8Array} the generated array.
+     */
+    finalize: function() {
+        return this.data;
+    }
+};
+
+// return the actual prototype of JSZip
+var out = {
+    /**
+     * Read an existing zip and merge the data in the current JSZip object.
+     * The implementation is in jszip-load.js, don't forget to include it.
+     * @param {String|ArrayBuffer|Uint8Array|Buffer} stream  The stream to load
+     * @param {Object} options Options for loading the stream.
+     *  options.base64 : is the stream in base64 ? default : false
+     * @return {JSZip} the current JSZip object
+     */
+    load: function(stream, options) {
+        throw new Error("Load method is not defined. Is the file jszip-load.js included ?");
+    },
+
+    /**
+     * Filter nested files/folders with the specified function.
+     * @param {Function} search the predicate to use :
+     * function (relativePath, file) {...}
+     * It takes 2 arguments : the relative path and the file.
+     * @return {Array} An array of matching elements.
+     */
+    filter: function(search) {
+        var result = [],
+            filename, relativePath, file, fileClone;
+        for (filename in this.files) {
+            if (!this.files.hasOwnProperty(filename)) {
+                continue;
+            }
+            file = this.files[filename];
+            // return a new object, don't let the user mess with our internal objects :)
+            fileClone = new ZipObject(file.name, file._data, extend(file.options));
+            relativePath = filename.slice(this.root.length, filename.length);
+            if (filename.slice(0, this.root.length) === this.root && // the file is in the current root
+            search(relativePath, fileClone)) { // and the file matches the function
+                result.push(fileClone);
+            }
+        }
+        return result;
+    },
+
+    /**
+     * Add a file to the zip file, or search a file.
+     * @param   {string|RegExp} name The name of the file to add (if data is defined),
+     * the name of the file to find (if no data) or a regex to match files.
+     * @param   {String|ArrayBuffer|Uint8Array|Buffer} data  The file data, either raw or base64 encoded
+     * @param   {Object} o     File options
+     * @return  {JSZip|Object|Array} this JSZip object (when adding a file),
+     * a file (when searching by string) or an array of files (when searching by regex).
+     */
+    file: function(name, data, o) {
+        if (arguments.length === 1) {
+            if (utils.isRegExp(name)) {
+                var regexp = name;
+                return this.filter(function(relativePath, file) {
+                    return !file.options.dir && regexp.test(relativePath);
+                });
+            }
+            else { // text
+                return this.filter(function(relativePath, file) {
+                    return !file.options.dir && relativePath === name;
+                })[0] || null;
+            }
+        }
+        else { // more than one argument : we have data !
+            name = this.root + name;
+            fileAdd.call(this, name, data, o);
+        }
+        return this;
+    },
+
+    /**
+     * Add a directory to the zip file, or search.
+     * @param   {String|RegExp} arg The name of the directory to add, or a regex to search folders.
+     * @return  {JSZip} an object with the new directory as the root, or an array containing matching folders.
+     */
+    folder: function(arg) {
+        if (!arg) {
+            return this;
+        }
+
+        if (utils.isRegExp(arg)) {
+            return this.filter(function(relativePath, file) {
+                return file.options.dir && arg.test(relativePath);
+            });
+        }
+
+        // else, name is a new folder
+        var name = this.root + arg;
+        var newFolder = folderAdd.call(this, name);
+
+        // Allow chaining by returning a new object with this folder as the root
+        var ret = this.clone();
+        ret.root = newFolder.name;
+        return ret;
+    },
+
+    /**
+     * Delete a file, or a directory and all sub-files, from the zip
+     * @param {string} name the name of the file to delete
+     * @return {JSZip} this JSZip object
+     */
+    remove: function(name) {
+        name = this.root + name;
+        var file = this.files[name];
+        if (!file) {
+            // Look for any folders
+            if (name.slice(-1) != "/") {
+                name += "/";
+            }
+            file = this.files[name];
+        }
+
+        if (file) {
+            if (!file.options.dir) {
+                // file
+                delete this.files[name];
+            }
+            else {
+                // folder
+                var kids = this.filter(function(relativePath, file) {
+                    return file.name.slice(0, name.length) === name;
+                });
+                for (var i = 0; i < kids.length; i++) {
+                    delete this.files[kids[i].name];
+                }
+            }
+        }
+
+        return this;
+    },
+
+    /**
+     * Generate the complete zip file
+     * @param {Object} options the options to generate the zip file :
+     * - base64, (deprecated, use type instead) true to generate base64.
+     * - compression, "STORE" by default.
+     * - type, "base64" by default. Values are : string, base64, uint8array, arraybuffer, blob.
+     * @return {String|Uint8Array|ArrayBuffer|Buffer|Blob} the zip file
+     */
+    generate: function(options) {
+        options = extend(options || {}, {
+            base64: true,
+            compression: "STORE",
+            type: "base64"
+        });
+
+        utils.checkSupport(options.type);
+
+        var zipData = [],
+            localDirLength = 0,
+            centralDirLength = 0,
+            writer, i;
+
+
+        // first, generate all the zip parts.
+        for (var name in this.files) {
+            if (!this.files.hasOwnProperty(name)) {
+                continue;
+            }
+            var file = this.files[name];
+
+            var compressionName = file.options.compression || options.compression.toUpperCase();
+            var compression = compressions[compressionName];
+            if (!compression) {
+                throw new Error(compressionName + " is not a valid compression method !");
+            }
+
+            var compressedObject = generateCompressedObjectFrom.call(this, file, compression);
+
+            var zipPart = generateZipParts.call(this, name, file, compressedObject, localDirLength);
+            localDirLength += zipPart.fileRecord.length + compressedObject.compressedSize;
+            centralDirLength += zipPart.dirRecord.length;
+            zipData.push(zipPart);
+        }
+
+        var dirEnd = "";
+
+        // end of central dir signature
+        dirEnd = signature.CENTRAL_DIRECTORY_END +
+        // number of this disk
+        "\x00\x00" +
+        // number of the disk with the start of the central directory
+        "\x00\x00" +
+        // total number of entries in the central directory on this disk
+        decToHex(zipData.length, 2) +
+        // total number of entries in the central directory
+        decToHex(zipData.length, 2) +
+        // size of the central directory   4 bytes
+        decToHex(centralDirLength, 4) +
+        // offset of start of central directory with respect to the starting disk number
+        decToHex(localDirLength, 4) +
+        // .ZIP file comment length
+        "\x00\x00";
+
+
+        // we have all the parts (and the total length)
+        // time to create a writer !
+        var typeName = options.type.toLowerCase();
+        if(typeName==="uint8array"||typeName==="arraybuffer"||typeName==="blob"||typeName==="nodebuffer") {
+            writer = new Uint8ArrayWriter(localDirLength + centralDirLength + dirEnd.length);
+        }else{
+            writer = new StringWriter(localDirLength + centralDirLength + dirEnd.length);
+        }
+
+        for (i = 0; i < zipData.length; i++) {
+            writer.append(zipData[i].fileRecord);
+            writer.append(zipData[i].compressedObject.compressedContent);
+        }
+        for (i = 0; i < zipData.length; i++) {
+            writer.append(zipData[i].dirRecord);
+        }
+
+        writer.append(dirEnd);
+
+        var zip = writer.finalize();
+
+
+
+        switch(options.type.toLowerCase()) {
+            // case "zip is an Uint8Array"
+            case "uint8array" :
+            case "arraybuffer" :
+            case "nodebuffer" :
+               return utils.transformTo(options.type.toLowerCase(), zip);
+            case "blob" :
+               return utils.arrayBuffer2Blob(utils.transformTo("arraybuffer", zip));
+            // case "zip is a string"
+            case "base64" :
+               return (options.base64) ? base64.encode(zip) : zip;
+            default : // case "string" :
+               return zip;
+         }
+      
+    },
+
+    /**
+     *
+     *  Javascript crc32
+     *  http://www.webtoolkit.info/
+     *
+     */
+    crc32: function crc32(input, crc) {
+        if (typeof input === "undefined" || !input.length) {
+            return 0;
+        }
+
+        var isArray = utils.getTypeOf(input) !== "string";
+
+        var table = [
+        0x00000000, 0x77073096, 0xEE0E612C, 0x990951BA,
+        0x076DC419, 0x706AF48F, 0xE963A535, 0x9E6495A3,
+        0x0EDB8832, 0x79DCB8A4, 0xE0D5E91E, 0x97D2D988,
+        0x09B64C2B, 0x7EB17CBD, 0xE7B82D07, 0x90BF1D91,
+        0x1DB71064, 0x6AB020F2, 0xF3B97148, 0x84BE41DE,
+        0x1ADAD47D, 0x6DDDE4EB, 0xF4D4B551, 0x83D385C7,
+        0x136C9856, 0x646BA8C0, 0xFD62F97A, 0x8A65C9EC,
+        0x14015C4F, 0x63066CD9, 0xFA0F3D63, 0x8D080DF5,
+        0x3B6E20C8, 0x4C69105E, 0xD56041E4, 0xA2677172,
+        0x3C03E4D1, 0x4B04D447, 0xD20D85FD, 0xA50AB56B,
+        0x35B5A8FA, 0x42B2986C, 0xDBBBC9D6, 0xACBCF940,
+        0x32D86CE3, 0x45DF5C75, 0xDCD60DCF, 0xABD13D59,
+        0x26D930AC, 0x51DE003A, 0xC8D75180, 0xBFD06116,
+        0x21B4F4B5, 0x56B3C423, 0xCFBA9599, 0xB8BDA50F,
+        0x2802B89E, 0x5F058808, 0xC60CD9B2, 0xB10BE924,
+        0x2F6F7C87, 0x58684C11, 0xC1611DAB, 0xB6662D3D,
+        0x76DC4190, 0x01DB7106, 0x98D220BC, 0xEFD5102A,
+        0x71B18589, 0x06B6B51F, 0x9FBFE4A5, 0xE8B8D433,
+        0x7807C9A2, 0x0F00F934, 0x9609A88E, 0xE10E9818,
+        0x7F6A0DBB, 0x086D3D2D, 0x91646C97, 0xE6635C01,
+        0x6B6B51F4, 0x1C6C6162, 0x856530D8, 0xF262004E,
+        0x6C0695ED, 0x1B01A57B, 0x8208F4C1, 0xF50FC457,
+        0x65B0D9C6, 0x12B7E950, 0x8BBEB8EA, 0xFCB9887C,
+        0x62DD1DDF, 0x15DA2D49, 0x8CD37CF3, 0xFBD44C65,
+        0x4DB26158, 0x3AB551CE, 0xA3BC0074, 0xD4BB30E2,
+        0x4ADFA541, 0x3DD895D7, 0xA4D1C46D, 0xD3D6F4FB,
+        0x4369E96A, 0x346ED9FC, 0xAD678846, 0xDA60B8D0,
+        0x44042D73, 0x33031DE5, 0xAA0A4C5F, 0xDD0D7CC9,
+        0x5005713C, 0x270241AA, 0xBE0B1010, 0xC90C2086,
+        0x5768B525, 0x206F85B3, 0xB966D409, 0xCE61E49F,
+        0x5EDEF90E, 0x29D9C998, 0xB0D09822, 0xC7D7A8B4,
+        0x59B33D17, 0x2EB40D81, 0xB7BD5C3B, 0xC0BA6CAD,
+        0xEDB88320, 0x9ABFB3B6, 0x03B6E20C, 0x74B1D29A,
+        0xEAD54739, 0x9DD277AF, 0x04DB2615, 0x73DC1683,
+        0xE3630B12, 0x94643B84, 0x0D6D6A3E, 0x7A6A5AA8,
+        0xE40ECF0B, 0x9309FF9D, 0x0A00AE27, 0x7D079EB1,
+        0xF00F9344, 0x8708A3D2, 0x1E01F268, 0x6906C2FE,
+        0xF762575D, 0x806567CB, 0x196C3671, 0x6E6B06E7,
+        0xFED41B76, 0x89D32BE0, 0x10DA7A5A, 0x67DD4ACC,
+        0xF9B9DF6F, 0x8EBEEFF9, 0x17B7BE43, 0x60B08ED5,
+        0xD6D6A3E8, 0xA1D1937E, 0x38D8C2C4, 0x4FDFF252,
+        0xD1BB67F1, 0xA6BC5767, 0x3FB506DD, 0x48B2364B,
+        0xD80D2BDA, 0xAF0A1B4C, 0x36034AF6, 0x41047A60,
+        0xDF60EFC3, 0xA867DF55, 0x316E8EEF, 0x4669BE79,
+        0xCB61B38C, 0xBC66831A, 0x256FD2A0, 0x5268E236,
+        0xCC0C7795, 0xBB0B4703, 0x220216B9, 0x5505262F,
+        0xC5BA3BBE, 0xB2BD0B28, 0x2BB45A92, 0x5CB36A04,
+        0xC2D7FFA7, 0xB5D0CF31, 0x2CD99E8B, 0x5BDEAE1D,
+        0x9B64C2B0, 0xEC63F226, 0x756AA39C, 0x026D930A,
+        0x9C0906A9, 0xEB0E363F, 0x72076785, 0x05005713,
+        0x95BF4A82, 0xE2B87A14, 0x7BB12BAE, 0x0CB61B38,
+        0x92D28E9B, 0xE5D5BE0D, 0x7CDCEFB7, 0x0BDBDF21,
+        0x86D3D2D4, 0xF1D4E242, 0x68DDB3F8, 0x1FDA836E,
+        0x81BE16CD, 0xF6B9265B, 0x6FB077E1, 0x18B74777,
+        0x88085AE6, 0xFF0F6A70, 0x66063BCA, 0x11010B5C,
+        0x8F659EFF, 0xF862AE69, 0x616BFFD3, 0x166CCF45,
+        0xA00AE278, 0xD70DD2EE, 0x4E048354, 0x3903B3C2,
+        0xA7672661, 0xD06016F7, 0x4969474D, 0x3E6E77DB,
+        0xAED16A4A, 0xD9D65ADC, 0x40DF0B66, 0x37D83BF0,
+        0xA9BCAE53, 0xDEBB9EC5, 0x47B2CF7F, 0x30B5FFE9,
+        0xBDBDF21C, 0xCABAC28A, 0x53B39330, 0x24B4A3A6,
+        0xBAD03605, 0xCDD70693, 0x54DE5729, 0x23D967BF,
+        0xB3667A2E, 0xC4614AB8, 0x5D681B02, 0x2A6F2B94,
+        0xB40BBE37, 0xC30C8EA1, 0x5A05DF1B, 0x2D02EF8D];
+
+        if (typeof(crc) == "undefined") {
+            crc = 0;
+        }
+        var x = 0;
+        var y = 0;
+        var b = 0;
+
+        crc = crc ^ (-1);
+        for (var i = 0, iTop = input.length; i < iTop; i++) {
+            b = isArray ? input[i] : input.charCodeAt(i);
+            y = (crc ^ b) & 0xFF;
+            x = table[y];
+            crc = (crc >>> 8) ^ x;
+        }
+
+        return crc ^ (-1);
+    },
+
+    // Inspired by http://my.opera.com/GreyWyvern/blog/show.dml/1725165
+
+    /**
+     * http://www.webtoolkit.info/javascript-utf8.html
+     */
+    utf8encode: function(string) {
+        // TextEncoder + Uint8Array to binary string is faster than checking every bytes on long strings.
+        // http://jsperf.com/utf8encode-vs-textencoder
+        // On short strings (file names for example), the TextEncoder API is (currently) slower.
+        if (textEncoder) {
+            var u8 = textEncoder.encode(string);
+            return utils.transformTo("string", u8);
+        }
+        if (support.nodebuffer) {
+            return utils.transformTo("string", nodeBuffer(string, "utf-8"));
+        }
+
+        // array.join may be slower than string concatenation but generates less objects (less time spent garbage collecting).
+        // See also http://jsperf.com/array-direct-assignment-vs-push/31
+        var result = [],
+            resIndex = 0;
+
+        for (var n = 0; n < string.length; n++) {
+
+            var c = string.charCodeAt(n);
+
+            if (c < 128) {
+                result[resIndex++] = String.fromCharCode(c);
+            }
+            else if ((c > 127) && (c < 2048)) {
+                result[resIndex++] = String.fromCharCode((c >> 6) | 192);
+                result[resIndex++] = String.fromCharCode((c & 63) | 128);
+            }
+            else {
+                result[resIndex++] = String.fromCharCode((c >> 12) | 224);
+                result[resIndex++] = String.fromCharCode(((c >> 6) & 63) | 128);
+                result[resIndex++] = String.fromCharCode((c & 63) | 128);
+            }
+
+        }
+
+        return result.join("");
+    },
+
+    /**
+     * http://www.webtoolkit.info/javascript-utf8.html
+     */
+    utf8decode: function(input) {
+        var result = [],
+            resIndex = 0;
+        var type = utils.getTypeOf(input);
+        var isArray = type !== "string";
+        var i = 0;
+        var c = 0,
+            c1 = 0,
+            c2 = 0,
+            c3 = 0;
+
+        // check if we can use the TextDecoder API
+        // see http://encoding.spec.whatwg.org/#api
+        if (textDecoder) {
+            return textDecoder.decode(
+                utils.transformTo("uint8array", input)
+            );
+        }
+        if (support.nodebuffer) {
+            return utils.transformTo("nodebuffer", input).toString("utf-8");
+        }
+
+        while (i < input.length) {
+
+            c = isArray ? input[i] : input.charCodeAt(i);
+
+            if (c < 128) {
+                result[resIndex++] = String.fromCharCode(c);
+                i++;
+            }
+            else if ((c > 191) && (c < 224)) {
+                c2 = isArray ? input[i + 1] : input.charCodeAt(i + 1);
+                result[resIndex++] = String.fromCharCode(((c & 31) << 6) | (c2 & 63));
+                i += 2;
+            }
+            else {
+                c2 = isArray ? input[i + 1] : input.charCodeAt(i + 1);
+                c3 = isArray ? input[i + 2] : input.charCodeAt(i + 2);
+                result[resIndex++] = String.fromCharCode(((c & 15) << 12) | ((c2 & 63) << 6) | (c3 & 63));
+                i += 3;
+            }
+
+        }
+
+        return result.join("");
+    }
+};
+module.exports = out;
+
+},{"./base64":82,"./compressedObject":83,"./compressions":84,"./defaults":86,"./nodeBuffer":64,"./signature":91,"./support":93,"./utils":95}],91:[function(_dereq_,module,exports){
+'use strict';
+exports.LOCAL_FILE_HEADER = "PK\x03\x04";
+exports.CENTRAL_FILE_HEADER = "PK\x01\x02";
+exports.CENTRAL_DIRECTORY_END = "PK\x05\x06";
+exports.ZIP64_CENTRAL_DIRECTORY_LOCATOR = "PK\x06\x07";
+exports.ZIP64_CENTRAL_DIRECTORY_END = "PK\x06\x06";
+exports.DATA_DESCRIPTOR = "PK\x07\x08";
+
+},{}],92:[function(_dereq_,module,exports){
+'use strict';
+var DataReader = _dereq_('./dataReader');
+var utils = _dereq_('./utils');
+
+function StringReader(data, optimizedBinaryString) {
+    this.data = data;
+    if (!optimizedBinaryString) {
+        this.data = utils.string2binary(this.data);
+    }
+    this.length = this.data.length;
+    this.index = 0;
+}
+StringReader.prototype = new DataReader();
+/**
+ * @see DataReader.byteAt
+ */
+StringReader.prototype.byteAt = function(i) {
+    return this.data.charCodeAt(i);
+};
+/**
+ * @see DataReader.lastIndexOfSignature
+ */
+StringReader.prototype.lastIndexOfSignature = function(sig) {
+    return this.data.lastIndexOf(sig);
+};
+/**
+ * @see DataReader.readData
+ */
+StringReader.prototype.readData = function(size) {
+    this.checkOffset(size);
+    // this will work because the constructor applied the "& 0xff" mask.
+    var result = this.data.slice(this.index, this.index + size);
+    this.index += size;
+    return result;
+};
+module.exports = StringReader;
+
+},{"./dataReader":85,"./utils":95}],93:[function(_dereq_,module,exports){
+(function (process){
+'use strict';
+exports.base64 = true;
+exports.array = true;
+exports.string = true;
+exports.arraybuffer = typeof ArrayBuffer !== "undefined" && typeof Uint8Array !== "undefined";
+// contains true if JSZip can read/generate nodejs Buffer, false otherwise, aka checks if we arn't in a browser.
+exports.nodebuffer = !process.browser;
+// contains true if JSZip can read/generate Uint8Array, false otherwise.
+exports.uint8array = typeof Uint8Array !== "undefined";
+
+if (typeof ArrayBuffer === "undefined") {
+    exports.blob = false;
+}
+else {
+    var buffer = new ArrayBuffer(0);
+    try {
+        exports.blob = new Blob([buffer], {
+            type: "application/zip"
+        }).size === 0;
+    }
+    catch (e) {
+        try {
+            var Builder = window.BlobBuilder || window.WebKitBlobBuilder || window.MozBlobBuilder || window.MSBlobBuilder;
+            var builder = new Builder();
+            builder.append(buffer);
+            exports.blob = builder.getBlob('application/zip').size === 0;
+        }
+        catch (e) {
+            exports.blob = false;
+        }
+    }
+}
+
+}).call(this,_dereq_("/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
+},{"/home/mick/Programming/current/mammoth/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":70}],94:[function(_dereq_,module,exports){
+'use strict';
+var DataReader = _dereq_('./dataReader');
+
+function Uint8ArrayReader(data) {
+    if (data) {
+        this.data = data;
+        this.length = this.data.length;
+        this.index = 0;
+    }
+}
+Uint8ArrayReader.prototype = new DataReader();
+/**
+ * @see DataReader.byteAt
+ */
+Uint8ArrayReader.prototype.byteAt = function(i) {
+    return this.data[i];
+};
+/**
+ * @see DataReader.lastIndexOfSignature
+ */
+Uint8ArrayReader.prototype.lastIndexOfSignature = function(sig) {
+    var sig0 = sig.charCodeAt(0),
+        sig1 = sig.charCodeAt(1),
+        sig2 = sig.charCodeAt(2),
+        sig3 = sig.charCodeAt(3);
+    for (var i = this.length - 4; i >= 0; --i) {
+        if (this.data[i] === sig0 && this.data[i + 1] === sig1 && this.data[i + 2] === sig2 && this.data[i + 3] === sig3) {
+            return i;
+        }
+    }
+
+    return -1;
+};
+/**
+ * @see DataReader.readData
+ */
+Uint8ArrayReader.prototype.readData = function(size) {
+    this.checkOffset(size);
+    var result = this.data.subarray(this.index, this.index + size);
+    this.index += size;
+    return result;
+};
+module.exports = Uint8ArrayReader;
+
+},{"./dataReader":85}],95:[function(_dereq_,module,exports){
+'use strict';
+var support = _dereq_('./support');
+var compressions = _dereq_('./compressions');
+var nodeBuffer = _dereq_('./nodeBuffer');
+/**
+ * Convert a string to a "binary string" : a string containing only char codes between 0 and 255.
+ * @param {string} str the string to transform.
+ * @return {String} the binary string.
+ */
+exports.string2binary = function(str) {
+    var result = "";
+    for (var i = 0; i < str.length; i++) {
+        result += String.fromCharCode(str.charCodeAt(i) & 0xff);
+    }
+    return result;
+};
+/**
+ * Create a Uint8Array from the string.
+ * @param {string} str the string to transform.
+ * @return {Uint8Array} the typed array.
+ * @throws {Error} an Error if the browser doesn't support the requested feature.
+ */
+exports.string2Uint8Array = function(str) {
+    return exports.transformTo("uint8array", str);
+};
+
+/**
+ * Create a string from the Uint8Array.
+ * @param {Uint8Array} array the array to transform.
+ * @return {string} the string.
+ * @throws {Error} an Error if the browser doesn't support the requested feature.
+ */
+exports.uint8Array2String = function(array) {
+    return exports.transformTo("string", array);
+};
+/**
+ * Create a blob from the given string.
+ * @param {string} str the string to transform.
+ * @return {Blob} the string.
+ * @throws {Error} an Error if the browser doesn't support the requested feature.
+ */
+exports.string2Blob = function(str) {
+    var buffer = exports.transformTo("arraybuffer", str);
+    return exports.arrayBuffer2Blob(buffer);
+};
+exports.arrayBuffer2Blob = function(buffer) {
+    exports.checkSupport("blob");
+
+    try {
+        // Blob constructor
+        return new Blob([buffer], {
+            type: "application/zip"
+        });
+    }
+    catch (e) {
+
+        try {
+            // deprecated, browser only, old way
+            var Builder = window.BlobBuilder || window.WebKitBlobBuilder || window.MozBlobBuilder || window.MSBlobBuilder;
+            var builder = new Builder();
+            builder.append(buffer);
+            return builder.getBlob('application/zip');
+        }
+        catch (e) {
+
+            // well, fuck ?!
+            throw new Error("Bug : can't construct the Blob.");
+        }
+    }
+
+
+};
+/**
+ * The identity function.
+ * @param {Object} input the input.
+ * @return {Object} the same input.
+ */
+function identity(input) {
+    return input;
+}
+
+/**
+ * Fill in an array with a string.
+ * @param {String} str the string to use.
+ * @param {Array|ArrayBuffer|Uint8Array|Buffer} array the array to fill in (will be mutated).
+ * @return {Array|ArrayBuffer|Uint8Array|Buffer} the updated array.
+ */
+function stringToArrayLike(str, array) {
+    for (var i = 0; i < str.length; ++i) {
+        array[i] = str.charCodeAt(i) & 0xFF;
+    }
+    return array;
+}
+
+/**
+ * Transform an array-like object to a string.
+ * @param {Array|ArrayBuffer|Uint8Array|Buffer} array the array to transform.
+ * @return {String} the result.
+ */
+function arrayLikeToString(array) {
+    // Performances notes :
+    // --------------------
+    // String.fromCharCode.apply(null, array) is the fastest, see
+    // see http://jsperf.com/converting-a-uint8array-to-a-string/2
+    // but the stack is limited (and we can get huge arrays !).
+    //
+    // result += String.fromCharCode(array[i]); generate too many strings !
+    //
+    // This code is inspired by http://jsperf.com/arraybuffer-to-string-apply-performance/2
+    var chunk = 65536;
+    var result = [],
+        len = array.length,
+        type = exports.getTypeOf(array),
+        k = 0,
+        canUseApply = true;
+      try {
+         switch(type) {
+            case "uint8array":
+               String.fromCharCode.apply(null, new Uint8Array(0));
+               break;
+            case "nodebuffer":
+               String.fromCharCode.apply(null, nodeBuffer(0));
+               break;
+         }
+      } catch(e) {
+         canUseApply = false;
+      }
+
+      // no apply : slow and painful algorithm
+      // default browser on android 4.*
+      if (!canUseApply) {
+         var resultStr = "";
+         for(var i = 0; i < array.length;i++) {
+            resultStr += String.fromCharCode(array[i]);
+         }
+    return resultStr;
+    }
+    while (k < len && chunk > 1) {
+        try {
+            if (type === "array" || type === "nodebuffer") {
+                result.push(String.fromCharCode.apply(null, array.slice(k, Math.min(k + chunk, len))));
+            }
+            else {
+                result.push(String.fromCharCode.apply(null, array.subarray(k, Math.min(k + chunk, len))));
+            }
+            k += chunk;
+        }
+        catch (e) {
+            chunk = Math.floor(chunk / 2);
+        }
+    }
+    return result.join("");
+}
+
+/**
+ * Copy the data from an array-like to an other array-like.
+ * @param {Array|ArrayBuffer|Uint8Array|Buffer} arrayFrom the origin array.
+ * @param {Array|ArrayBuffer|Uint8Array|Buffer} arrayTo the destination array which will be mutated.
+ * @return {Array|ArrayBuffer|Uint8Array|Buffer} the updated destination array.
+ */
+function arrayLikeToArrayLike(arrayFrom, arrayTo) {
+    for (var i = 0; i < arrayFrom.length; i++) {
+        arrayTo[i] = arrayFrom[i];
+    }
+    return arrayTo;
+}
+
+// a matrix containing functions to transform everything into everything.
+var transform = {};
+
+// string to ?
+transform["string"] = {
+    "string": identity,
+    "array": function(input) {
+        return stringToArrayLike(input, new Array(input.length));
+    },
+    "arraybuffer": function(input) {
+        return transform["string"]["uint8array"](input).buffer;
+    },
+    "uint8array": function(input) {
+        return stringToArrayLike(input, new Uint8Array(input.length));
+    },
+    "nodebuffer": function(input) {
+        return stringToArrayLike(input, nodeBuffer(input.length));
+    }
+};
+
+// array to ?
+transform["array"] = {
+    "string": arrayLikeToString,
+    "array": identity,
+    "arraybuffer": function(input) {
+        return (new Uint8Array(input)).buffer;
+    },
+    "uint8array": function(input) {
+        return new Uint8Array(input);
+    },
+    "nodebuffer": function(input) {
+        return nodeBuffer(input);
+    }
+};
+
+// arraybuffer to ?
+transform["arraybuffer"] = {
+    "string": function(input) {
+        return arrayLikeToString(new Uint8Array(input));
+    },
+    "array": function(input) {
+        return arrayLikeToArrayLike(new Uint8Array(input), new Array(input.byteLength));
+    },
+    "arraybuffer": identity,
+    "uint8array": function(input) {
+        return new Uint8Array(input);
+    },
+    "nodebuffer": function(input) {
+        return nodeBuffer(new Uint8Array(input));
+    }
+};
+
+// uint8array to ?
+transform["uint8array"] = {
+    "string": arrayLikeToString,
+    "array": function(input) {
+        return arrayLikeToArrayLike(input, new Array(input.length));
+    },
+    "arraybuffer": function(input) {
+        return input.buffer;
+    },
+    "uint8array": identity,
+    "nodebuffer": function(input) {
+        return nodeBuffer(input);
+    }
+};
+
+// nodebuffer to ?
+transform["nodebuffer"] = {
+    "string": arrayLikeToString,
+    "array": function(input) {
+        return arrayLikeToArrayLike(input, new Array(input.length));
+    },
+    "arraybuffer": function(input) {
+        return transform["nodebuffer"]["uint8array"](input).buffer;
+    },
+    "uint8array": function(input) {
+        return arrayLikeToArrayLike(input, new Uint8Array(input.length));
+    },
+    "nodebuffer": identity
+};
+
+/**
+ * Transform an input into any type.
+ * The supported output type are : string, array, uint8array, arraybuffer, nodebuffer.
+ * If no output type is specified, the unmodified input will be returned.
+ * @param {String} outputType the output type.
+ * @param {String|Array|ArrayBuffer|Uint8Array|Buffer} input the input to convert.
+ * @throws {Error} an Error if the browser doesn't support the requested output type.
+ */
+exports.transformTo = function(outputType, input) {
+    if (!input) {
+        // undefined, null, etc
+        // an empty string won't harm.
+        input = "";
+    }
+    if (!outputType) {
+        return input;
+    }
+    exports.checkSupport(outputType);
+    var inputType = exports.getTypeOf(input);
+    var result = transform[inputType][outputType](input);
+    return result;
+};
+
+/**
+ * Return the type of the input.
+ * The type will be in a format valid for JSZip.utils.transformTo : string, array, uint8array, arraybuffer.
+ * @param {Object} input the input to identify.
+ * @return {String} the (lowercase) type of the input.
+ */
+exports.getTypeOf = function(input) {
+    if (typeof input === "string") {
+        return "string";
+    }
+    if (Object.prototype.toString.call(input) === "[object Array]") {
+        return "array";
+    }
+    if (support.nodebuffer && nodeBuffer.test(input)) {
+        return "nodebuffer";
+    }
+    if (support.uint8array && input instanceof Uint8Array) {
+        return "uint8array";
+    }
+    if (support.arraybuffer && input instanceof ArrayBuffer) {
+        return "arraybuffer";
+    }
+};
+
+/**
+ * Throw an exception if the type is not supported.
+ * @param {String} type the type to check.
+ * @throws {Error} an Error if the browser doesn't support the requested type.
+ */
+exports.checkSupport = function(type) {
+    var supported = support[type.toLowerCase()];
+    if (!supported) {
+        throw new Error(type + " is not supported by this browser");
+    }
+};
+exports.MAX_VALUE_16BITS = 65535;
+exports.MAX_VALUE_32BITS = -1; // well, "\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF" is parsed as -1
+
+/**
+ * Prettify a string read as binary.
+ * @param {string} str the string to prettify.
+ * @return {string} a pretty string.
+ */
+exports.pretty = function(str) {
+    var res = '',
+        code, i;
+    for (i = 0; i < (str || "").length; i++) {
+        code = str.charCodeAt(i);
+        res += '\\x' + (code < 16 ? "0" : "") + code.toString(16).toUpperCase();
+    }
+    return res;
+};
+
+/**
+ * Find a compression registered in JSZip.
+ * @param {string} compressionMethod the method magic to find.
+ * @return {Object|null} the JSZip compression object, null if none found.
+ */
+exports.findCompression = function(compressionMethod) {
+    for (var method in compressions) {
+        if (!compressions.hasOwnProperty(method)) {
+            continue;
+        }
+        if (compressions[method].magic === compressionMethod) {
+            return compressions[method];
+        }
+    }
+    return null;
+};
+/**
+* Cross-window, cross-Node-context regular expression detection
+* @param  {Object}  object Anything
+* @return {Boolean}        true if the object is a regular expression,
+* false otherwise
+*/
+exports.isRegExp = function (object) {
+    return Object.prototype.toString.call(object) === "[object RegExp]";
+};
+
+
+},{"./compressions":84,"./nodeBuffer":64,"./support":93}],96:[function(_dereq_,module,exports){
+'use strict';
+var StringReader = _dereq_('./stringReader');
+var NodeBufferReader = _dereq_('./nodeBufferReader');
+var Uint8ArrayReader = _dereq_('./uint8ArrayReader');
+var utils = _dereq_('./utils');
+var sig = _dereq_('./signature');
+var ZipEntry = _dereq_('./zipEntry');
+var support = _dereq_('./support');
+//  class ZipEntries {{{
+/**
+ * All the entries in the zip file.
+ * @constructor
+ * @param {String|ArrayBuffer|Uint8Array} data the binary stream to load.
+ * @param {Object} loadOptions Options for loading the stream.
+ */
+function ZipEntries(data, loadOptions) {
+    this.files = [];
+    this.loadOptions = loadOptions;
+    if (data) {
+        this.load(data);
+    }
+}
+ZipEntries.prototype = {
+    /**
+     * Check that the reader is on the speficied signature.
+     * @param {string} expectedSignature the expected signature.
+     * @throws {Error} if it is an other signature.
+     */
+    checkSignature: function(expectedSignature) {
+        var signature = this.reader.readString(4);
+        if (signature !== expectedSignature) {
+            throw new Error("Corrupted zip or bug : unexpected signature " + "(" + utils.pretty(signature) + ", expected " + utils.pretty(expectedSignature) + ")");
+        }
+    },
+    /**
+     * Read the end of the central directory.
+     */
+    readBlockEndOfCentral: function() {
+        this.diskNumber = this.reader.readInt(2);
+        this.diskWithCentralDirStart = this.reader.readInt(2);
+        this.centralDirRecordsOnThisDisk = this.reader.readInt(2);
+        this.centralDirRecords = this.reader.readInt(2);
+        this.centralDirSize = this.reader.readInt(4);
+        this.centralDirOffset = this.reader.readInt(4);
+
+        this.zipCommentLength = this.reader.readInt(2);
+        this.zipComment = this.reader.readString(this.zipCommentLength);
+    },
+    /**
+     * Read the end of the Zip 64 central directory.
+     * Not merged with the method readEndOfCentral :
+     * The end of central can coexist with its Zip64 brother,
+     * I don't want to read the wrong number of bytes !
+     */
+    readBlockZip64EndOfCentral: function() {
+        this.zip64EndOfCentralSize = this.reader.readInt(8);
+        this.versionMadeBy = this.reader.readString(2);
+        this.versionNeeded = this.reader.readInt(2);
+        this.diskNumber = this.reader.readInt(4);
+        this.diskWithCentralDirStart = this.reader.readInt(4);
+        this.centralDirRecordsOnThisDisk = this.reader.readInt(8);
+        this.centralDirRecords = this.reader.readInt(8);
+        this.centralDirSize = this.reader.readInt(8);
+        this.centralDirOffset = this.reader.readInt(8);
+
+        this.zip64ExtensibleData = {};
+        var extraDataSize = this.zip64EndOfCentralSize - 44,
+            index = 0,
+            extraFieldId,
+            extraFieldLength,
+            extraFieldValue;
+        while (index < extraDataSize) {
+            extraFieldId = this.reader.readInt(2);
+            extraFieldLength = this.reader.readInt(4);
+            extraFieldValue = this.reader.readString(extraFieldLength);
+            this.zip64ExtensibleData[extraFieldId] = {
+                id: extraFieldId,
+                length: extraFieldLength,
+                value: extraFieldValue
+            };
+        }
+    },
+    /**
+     * Read the end of the Zip 64 central directory locator.
+     */
+    readBlockZip64EndOfCentralLocator: function() {
+        this.diskWithZip64CentralDirStart = this.reader.readInt(4);
+        this.relativeOffsetEndOfZip64CentralDir = this.reader.readInt(8);
+        this.disksCount = this.reader.readInt(4);
+        if (this.disksCount > 1) {
+            throw new Error("Multi-volumes zip are not supported");
+        }
+    },
+    /**
+     * Read the local files, based on the offset read in the central part.
+     */
+    readLocalFiles: function() {
+        var i, file;
+        for (i = 0; i < this.files.length; i++) {
+            file = this.files[i];
+            this.reader.setIndex(file.localHeaderOffset);
+            this.checkSignature(sig.LOCAL_FILE_HEADER);
+            file.readLocalPart(this.reader);
+            file.handleUTF8();
+        }
+    },
+    /**
+     * Read the central directory.
+     */
+    readCentralDir: function() {
+        var file;
+
+        this.reader.setIndex(this.centralDirOffset);
+        while (this.reader.readString(4) === sig.CENTRAL_FILE_HEADER) {
+            file = new ZipEntry({
+                zip64: this.zip64
+            }, this.loadOptions);
+            file.readCentralPart(this.reader);
+            this.files.push(file);
+        }
+    },
+    /**
+     * Read the end of central directory.
+     */
+    readEndOfCentral: function() {
+        var offset = this.reader.lastIndexOfSignature(sig.CENTRAL_DIRECTORY_END);
+        if (offset === -1) {
+            throw new Error("Corrupted zip : can't find end of central directory");
+        }
+        this.reader.setIndex(offset);
+        this.checkSignature(sig.CENTRAL_DIRECTORY_END);
+        this.readBlockEndOfCentral();
+
+
+        /* extract from the zip spec :
+            4)  If one of the fields in the end of central directory
+                record is too small to hold required data, the field
+                should be set to -1 (0xFFFF or 0xFFFFFFFF) and the
+                ZIP64 format record should be created.
+            5)  The end of central directory record and the
+                Zip64 end of central directory locator record must
+                reside on the same disk when splitting or spanning
+                an archive.
+         */
+        if (this.diskNumber === utils.MAX_VALUE_16BITS || this.diskWithCentralDirStart === utils.MAX_VALUE_16BITS || this.centralDirRecordsOnThisDisk === utils.MAX_VALUE_16BITS || this.centralDirRecords === utils.MAX_VALUE_16BITS || this.centralDirSize === utils.MAX_VALUE_32BITS || this.centralDirOffset === utils.MAX_VALUE_32BITS) {
+            this.zip64 = true;
+
+            /*
+            Warning : the zip64 extension is supported, but ONLY if the 64bits integer read from
+            the zip file can fit into a 32bits integer. This cannot be solved : Javascript represents
+            all numbers as 64-bit double precision IEEE 754 floating point numbers.
+            So, we have 53bits for integers and bitwise operations treat everything as 32bits.
+            see https://developer.mozilla.org/en-US/docs/JavaScript/Reference/Operators/Bitwise_Operators
+            and http://www.ecma-international.org/publications/files/ECMA-ST/ECMA-262.pdf section 8.5
+            */
+
+            // should look for a zip64 EOCD locator
+            offset = this.reader.lastIndexOfSignature(sig.ZIP64_CENTRAL_DIRECTORY_LOCATOR);
+            if (offset === -1) {
+                throw new Error("Corrupted zip : can't find the ZIP64 end of central directory locator");
+            }
+            this.reader.setIndex(offset);
+            this.checkSignature(sig.ZIP64_CENTRAL_DIRECTORY_LOCATOR);
+            this.readBlockZip64EndOfCentralLocator();
+
+            // now the zip64 EOCD record
+            this.reader.setIndex(this.relativeOffsetEndOfZip64CentralDir);
+            this.checkSignature(sig.ZIP64_CENTRAL_DIRECTORY_END);
+            this.readBlockZip64EndOfCentral();
+        }
+    },
+    prepareReader: function(data) {
+        var type = utils.getTypeOf(data);
+        if (type === "string" && !support.uint8array) {
+            this.reader = new StringReader(data, this.loadOptions.optimizedBinaryString);
+        }
+        else if (type === "nodebuffer") {
+            this.reader = new NodeBufferReader(data);
+        }
+        else {
+            this.reader = new Uint8ArrayReader(utils.transformTo("uint8array", data));
+        }
+    },
+    /**
+     * Read a zip file and create ZipEntries.
+     * @param {String|ArrayBuffer|Uint8Array|Buffer} data the binary string representing a zip file.
+     */
+    load: function(data) {
+        this.prepareReader(data);
+        this.readEndOfCentral();
+        this.readCentralDir();
+        this.readLocalFiles();
+    }
+};
+// }}} end of ZipEntries
+module.exports = ZipEntries;
+
+},{"./nodeBufferReader":64,"./signature":91,"./stringReader":92,"./support":93,"./uint8ArrayReader":94,"./utils":95,"./zipEntry":97}],97:[function(_dereq_,module,exports){
+'use strict';
+var StringReader = _dereq_('./stringReader');
+var utils = _dereq_('./utils');
+var CompressedObject = _dereq_('./compressedObject');
+var jszipProto = _dereq_('./object');
+// class ZipEntry {{{
+/**
+ * An entry in the zip file.
+ * @constructor
+ * @param {Object} options Options of the current file.
+ * @param {Object} loadOptions Options for loading the stream.
+ */
+function ZipEntry(options, loadOptions) {
+    this.options = options;
+    this.loadOptions = loadOptions;
+}
+ZipEntry.prototype = {
+    /**
+     * say if the file is encrypted.
+     * @return {boolean} true if the file is encrypted, false otherwise.
+     */
+    isEncrypted: function() {
+        // bit 1 is set
+        return (this.bitFlag & 0x0001) === 0x0001;
+    },
+    /**
+     * say if the file has utf-8 filename/comment.
+     * @return {boolean} true if the filename/comment is in utf-8, false otherwise.
+     */
+    useUTF8: function() {
+        // bit 11 is set
+        return (this.bitFlag & 0x0800) === 0x0800;
+    },
+    /**
+     * Prepare the function used to generate the compressed content from this ZipFile.
+     * @param {DataReader} reader the reader to use.
+     * @param {number} from the offset from where we should read the data.
+     * @param {number} length the length of the data to read.
+     * @return {Function} the callback to get the compressed content (the type depends of the DataReader class).
+     */
+    prepareCompressedContent: function(reader, from, length) {
+        return function() {
+            var previousIndex = reader.index;
+            reader.setIndex(from);
+            var compressedFileData = reader.readData(length);
+            reader.setIndex(previousIndex);
+
+            return compressedFileData;
+        };
+    },
+    /**
+     * Prepare the function used to generate the uncompressed content from this ZipFile.
+     * @param {DataReader} reader the reader to use.
+     * @param {number} from the offset from where we should read the data.
+     * @param {number} length the length of the data to read.
+     * @param {JSZip.compression} compression the compression used on this file.
+     * @param {number} uncompressedSize the uncompressed size to expect.
+     * @return {Function} the callback to get the uncompressed content (the type depends of the DataReader class).
+     */
+    prepareContent: function(reader, from, length, compression, uncompressedSize) {
+        return function() {
+
+            var compressedFileData = utils.transformTo(compression.uncompressInputType, this.getCompressedContent());
+            var uncompressedFileData = compression.uncompress(compressedFileData);
+
+            if (uncompressedFileData.length !== uncompressedSize) {
+                throw new Error("Bug : uncompressed data size mismatch");
+            }
+
+            return uncompressedFileData;
+        };
+    },
+    /**
+     * Read the local part of a zip file and add the info in this object.
+     * @param {DataReader} reader the reader to use.
+     */
+    readLocalPart: function(reader) {
+        var compression, localExtraFieldsLength;
+
+        // we already know everything from the central dir !
+        // If the central dir data are false, we are doomed.
+        // On the bright side, the local part is scary  : zip64, data descriptors, both, etc.
+        // The less data we get here, the more reliable this should be.
+        // Let's skip the whole header and dash to the data !
+        reader.skip(22);
+        // in some zip created on windows, the filename stored in the central dir contains \ instead of /.
+        // Strangely, the filename here is OK.
+        // I would love to treat these zip files as corrupted (see http://www.info-zip.org/FAQ.html#backslashes
+        // or APPNOTE#4.4.17.1, "All slashes MUST be forward slashes '/'") but there are a lot of bad zip generators...
+        // Search "unzip mismatching "local" filename continuing with "central" filename version" on
+        // the internet.
+        //
+        // I think I see the logic here : the central directory is used to display
+        // content and the local directory is used to extract the files. Mixing / and \
+        // may be used to display \ to windows users and use / when extracting the files.
+        // Unfortunately, this lead also to some issues : http://seclists.org/fulldisclosure/2009/Sep/394
+        this.fileNameLength = reader.readInt(2);
+        localExtraFieldsLength = reader.readInt(2); // can't be sure this will be the same as the central dir
+        this.fileName = reader.readString(this.fileNameLength);
+        reader.skip(localExtraFieldsLength);
+
+        if (this.compressedSize == -1 || this.uncompressedSize == -1) {
+            throw new Error("Bug or corrupted zip : didn't get enough informations from the central directory " + "(compressedSize == -1 || uncompressedSize == -1)");
+        }
+
+        compression = utils.findCompression(this.compressionMethod);
+        if (compression === null) { // no compression found
+            throw new Error("Corrupted zip : compression " + utils.pretty(this.compressionMethod) + " unknown (inner file : " + this.fileName + ")");
+        }
+        this.decompressed = new CompressedObject();
+        this.decompressed.compressedSize = this.compressedSize;
+        this.decompressed.uncompressedSize = this.uncompressedSize;
+        this.decompressed.crc32 = this.crc32;
+        this.decompressed.compressionMethod = this.compressionMethod;
+        this.decompressed.getCompressedContent = this.prepareCompressedContent(reader, reader.index, this.compressedSize, compression);
+        this.decompressed.getContent = this.prepareContent(reader, reader.index, this.compressedSize, compression, this.uncompressedSize);
+
+        // we need to compute the crc32...
+        if (this.loadOptions.checkCRC32) {
+            this.decompressed = utils.transformTo("string", this.decompressed.getContent());
+            if (jszipProto.crc32(this.decompressed) !== this.crc32) {
+                throw new Error("Corrupted zip : CRC32 mismatch");
+            }
+        }
+    },
+
+    /**
+     * Read the central part of a zip file and add the info in this object.
+     * @param {DataReader} reader the reader to use.
+     */
+    readCentralPart: function(reader) {
+        this.versionMadeBy = reader.readString(2);
+        this.versionNeeded = reader.readInt(2);
+        this.bitFlag = reader.readInt(2);
+        this.compressionMethod = reader.readString(2);
+        this.date = reader.readDate();
+        this.crc32 = reader.readInt(4);
+        this.compressedSize = reader.readInt(4);
+        this.uncompressedSize = reader.readInt(4);
+        this.fileNameLength = reader.readInt(2);
+        this.extraFieldsLength = reader.readInt(2);
+        this.fileCommentLength = reader.readInt(2);
+        this.diskNumberStart = reader.readInt(2);
+        this.internalFileAttributes = reader.readInt(2);
+        this.externalFileAttributes = reader.readInt(4);
+        this.localHeaderOffset = reader.readInt(4);
+
+        if (this.isEncrypted()) {
+            throw new Error("Encrypted zip are not supported");
+        }
+
+        this.fileName = reader.readString(this.fileNameLength);
+        this.readExtraFields(reader);
+        this.parseZIP64ExtraField(reader);
+        this.fileComment = reader.readString(this.fileCommentLength);
+
+        // warning, this is true only for zip with madeBy == DOS (plateform dependent feature)
+        this.dir = this.externalFileAttributes & 0x00000010 ? true : false;
+    },
+    /**
+     * Parse the ZIP64 extra field and merge the info in the current ZipEntry.
+     * @param {DataReader} reader the reader to use.
+     */
+    parseZIP64ExtraField: function(reader) {
+
+        if (!this.extraFields[0x0001]) {
+            return;
+        }
+
+        // should be something, preparing the extra reader
+        var extraReader = new StringReader(this.extraFields[0x0001].value);
+
+        // I really hope that these 64bits integer can fit in 32 bits integer, because js
+        // won't let us have more.
+        if (this.uncompressedSize === utils.MAX_VALUE_32BITS) {
+            this.uncompressedSize = extraReader.readInt(8);
+        }
+        if (this.compressedSize === utils.MAX_VALUE_32BITS) {
+            this.compressedSize = extraReader.readInt(8);
+        }
+        if (this.localHeaderOffset === utils.MAX_VALUE_32BITS) {
+            this.localHeaderOffset = extraReader.readInt(8);
+        }
+        if (this.diskNumberStart === utils.MAX_VALUE_32BITS) {
+            this.diskNumberStart = extraReader.readInt(4);
+        }
+    },
+    /**
+     * Read the central part of a zip file and add the info in this object.
+     * @param {DataReader} reader the reader to use.
+     */
+    readExtraFields: function(reader) {
+        var start = reader.index,
+            extraFieldId,
+            extraFieldLength,
+            extraFieldValue;
+
+        this.extraFields = this.extraFields || {};
+
+        while (reader.index < start + this.extraFieldsLength) {
+            extraFieldId = reader.readInt(2);
+            extraFieldLength = reader.readInt(2);
+            extraFieldValue = reader.readString(extraFieldLength);
+
+            this.extraFields[extraFieldId] = {
+                id: extraFieldId,
+                length: extraFieldLength,
+                value: extraFieldValue
+            };
+        }
+    },
+    /**
+     * Apply an UTF8 transformation if needed.
+     */
+    handleUTF8: function() {
+        if (this.useUTF8()) {
+            this.fileName = jszipProto.utf8decode(this.fileName);
+            this.fileComment = jszipProto.utf8decode(this.fileComment);
+        } else {
+            var upath = this.findExtraFieldUnicodePath();
+            if (upath !== null) {
+                this.fileName = upath;
+            }
+        }
+    },
+
+    /**
+     * Find the unicode path declared in the extra field, if any.
+     * @return {String} the unicode path, null otherwise.
+     */
+    findExtraFieldUnicodePath: function() {
+        var upathField = this.extraFields[0x7075];
+        if (upathField) {
+            var extraReader = new StringReader(upathField.value);
+
+            // wrong version
+            if (extraReader.readInt(1) !== 1) {
+                return null;
+            }
+
+            // the crc of the filename changed, this field is out of date.
+            if (jszipProto.crc32(this.fileName) !== extraReader.readInt(4)) {
+                return null;
+            }
+
+            return jszipProto.utf8decode(extraReader.readString(upathField.length - 5));
+        }
+        return null;
+    }
+};
+module.exports = ZipEntry;
+
+},{"./compressedObject":83,"./object":90,"./stringReader":92,"./utils":95}],98:[function(_dereq_,module,exports){
+/** @license zlib.js 2012 - imaya [ https://github.com/imaya/zlib.js ] The MIT License */(function() {'use strict';var n=void 0,u=!0,aa=this;function ba(e,d){var c=e.split("."),f=aa;!(c[0]in f)&&f.execScript&&f.execScript("var "+c[0]);for(var a;c.length&&(a=c.shift());)!c.length&&d!==n?f[a]=d:f=f[a]?f[a]:f[a]={}};var C="undefined"!==typeof Uint8Array&&"undefined"!==typeof Uint16Array&&"undefined"!==typeof Uint32Array&&"undefined"!==typeof DataView;function K(e,d){this.index="number"===typeof d?d:0;this.d=0;this.buffer=e instanceof(C?Uint8Array:Array)?e:new (C?Uint8Array:Array)(32768);if(2*this.buffer.length<=this.index)throw Error("invalid index");this.buffer.length<=this.index&&ca(this)}function ca(e){var d=e.buffer,c,f=d.length,a=new (C?Uint8Array:Array)(f<<1);if(C)a.set(d);else for(c=0;c<f;++c)a[c]=d[c];return e.buffer=a}
+K.prototype.a=function(e,d,c){var f=this.buffer,a=this.index,b=this.d,k=f[a],m;c&&1<d&&(e=8<d?(L[e&255]<<24|L[e>>>8&255]<<16|L[e>>>16&255]<<8|L[e>>>24&255])>>32-d:L[e]>>8-d);if(8>d+b)k=k<<d|e,b+=d;else for(m=0;m<d;++m)k=k<<1|e>>d-m-1&1,8===++b&&(b=0,f[a++]=L[k],k=0,a===f.length&&(f=ca(this)));f[a]=k;this.buffer=f;this.d=b;this.index=a};K.prototype.finish=function(){var e=this.buffer,d=this.index,c;0<this.d&&(e[d]<<=8-this.d,e[d]=L[e[d]],d++);C?c=e.subarray(0,d):(e.length=d,c=e);return c};
+var ga=new (C?Uint8Array:Array)(256),M;for(M=0;256>M;++M){for(var R=M,S=R,ha=7,R=R>>>1;R;R>>>=1)S<<=1,S|=R&1,--ha;ga[M]=(S<<ha&255)>>>0}var L=ga;function ja(e){this.buffer=new (C?Uint16Array:Array)(2*e);this.length=0}ja.prototype.getParent=function(e){return 2*((e-2)/4|0)};ja.prototype.push=function(e,d){var c,f,a=this.buffer,b;c=this.length;a[this.length++]=d;for(a[this.length++]=e;0<c;)if(f=this.getParent(c),a[c]>a[f])b=a[c],a[c]=a[f],a[f]=b,b=a[c+1],a[c+1]=a[f+1],a[f+1]=b,c=f;else break;return this.length};
+ja.prototype.pop=function(){var e,d,c=this.buffer,f,a,b;d=c[0];e=c[1];this.length-=2;c[0]=c[this.length];c[1]=c[this.length+1];for(b=0;;){a=2*b+2;if(a>=this.length)break;a+2<this.length&&c[a+2]>c[a]&&(a+=2);if(c[a]>c[b])f=c[b],c[b]=c[a],c[a]=f,f=c[b+1],c[b+1]=c[a+1],c[a+1]=f;else break;b=a}return{index:e,value:d,length:this.length}};function ka(e,d){this.e=ma;this.f=0;this.input=C&&e instanceof Array?new Uint8Array(e):e;this.c=0;d&&(d.lazy&&(this.f=d.lazy),"number"===typeof d.compressionType&&(this.e=d.compressionType),d.outputBuffer&&(this.b=C&&d.outputBuffer instanceof Array?new Uint8Array(d.outputBuffer):d.outputBuffer),"number"===typeof d.outputIndex&&(this.c=d.outputIndex));this.b||(this.b=new (C?Uint8Array:Array)(32768))}var ma=2,T=[],U;
+for(U=0;288>U;U++)switch(u){case 143>=U:T.push([U+48,8]);break;case 255>=U:T.push([U-144+400,9]);break;case 279>=U:T.push([U-256+0,7]);break;case 287>=U:T.push([U-280+192,8]);break;default:throw"invalid literal: "+U;}
+ka.prototype.h=function(){var e,d,c,f,a=this.input;switch(this.e){case 0:c=0;for(f=a.length;c<f;){d=C?a.subarray(c,c+65535):a.slice(c,c+65535);c+=d.length;var b=d,k=c===f,m=n,g=n,p=n,v=n,x=n,l=this.b,h=this.c;if(C){for(l=new Uint8Array(this.b.buffer);l.length<=h+b.length+5;)l=new Uint8Array(l.length<<1);l.set(this.b)}m=k?1:0;l[h++]=m|0;g=b.length;p=~g+65536&65535;l[h++]=g&255;l[h++]=g>>>8&255;l[h++]=p&255;l[h++]=p>>>8&255;if(C)l.set(b,h),h+=b.length,l=l.subarray(0,h);else{v=0;for(x=b.length;v<x;++v)l[h++]=
+b[v];l.length=h}this.c=h;this.b=l}break;case 1:var q=new K(C?new Uint8Array(this.b.buffer):this.b,this.c);q.a(1,1,u);q.a(1,2,u);var t=na(this,a),w,da,z;w=0;for(da=t.length;w<da;w++)if(z=t[w],K.prototype.a.apply(q,T[z]),256<z)q.a(t[++w],t[++w],u),q.a(t[++w],5),q.a(t[++w],t[++w],u);else if(256===z)break;this.b=q.finish();this.c=this.b.length;break;case ma:var B=new K(C?new Uint8Array(this.b.buffer):this.b,this.c),ra,J,N,O,P,Ia=[16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15],W,sa,X,ta,ea,ia=Array(19),
+ua,Q,fa,y,va;ra=ma;B.a(1,1,u);B.a(ra,2,u);J=na(this,a);W=oa(this.j,15);sa=pa(W);X=oa(this.i,7);ta=pa(X);for(N=286;257<N&&0===W[N-1];N--);for(O=30;1<O&&0===X[O-1];O--);var wa=N,xa=O,F=new (C?Uint32Array:Array)(wa+xa),r,G,s,Y,E=new (C?Uint32Array:Array)(316),D,A,H=new (C?Uint8Array:Array)(19);for(r=G=0;r<wa;r++)F[G++]=W[r];for(r=0;r<xa;r++)F[G++]=X[r];if(!C){r=0;for(Y=H.length;r<Y;++r)H[r]=0}r=D=0;for(Y=F.length;r<Y;r+=G){for(G=1;r+G<Y&&F[r+G]===F[r];++G);s=G;if(0===F[r])if(3>s)for(;0<s--;)E[D++]=0,
+H[0]++;else for(;0<s;)A=138>s?s:138,A>s-3&&A<s&&(A=s-3),10>=A?(E[D++]=17,E[D++]=A-3,H[17]++):(E[D++]=18,E[D++]=A-11,H[18]++),s-=A;else if(E[D++]=F[r],H[F[r]]++,s--,3>s)for(;0<s--;)E[D++]=F[r],H[F[r]]++;else for(;0<s;)A=6>s?s:6,A>s-3&&A<s&&(A=s-3),E[D++]=16,E[D++]=A-3,H[16]++,s-=A}e=C?E.subarray(0,D):E.slice(0,D);ea=oa(H,7);for(y=0;19>y;y++)ia[y]=ea[Ia[y]];for(P=19;4<P&&0===ia[P-1];P--);ua=pa(ea);B.a(N-257,5,u);B.a(O-1,5,u);B.a(P-4,4,u);for(y=0;y<P;y++)B.a(ia[y],3,u);y=0;for(va=e.length;y<va;y++)if(Q=
+e[y],B.a(ua[Q],ea[Q],u),16<=Q){y++;switch(Q){case 16:fa=2;break;case 17:fa=3;break;case 18:fa=7;break;default:throw"invalid code: "+Q;}B.a(e[y],fa,u)}var ya=[sa,W],za=[ta,X],I,Aa,Z,la,Ba,Ca,Da,Ea;Ba=ya[0];Ca=ya[1];Da=za[0];Ea=za[1];I=0;for(Aa=J.length;I<Aa;++I)if(Z=J[I],B.a(Ba[Z],Ca[Z],u),256<Z)B.a(J[++I],J[++I],u),la=J[++I],B.a(Da[la],Ea[la],u),B.a(J[++I],J[++I],u);else if(256===Z)break;this.b=B.finish();this.c=this.b.length;break;default:throw"invalid compression type";}return this.b};
+function qa(e,d){this.length=e;this.g=d}
+var Fa=function(){function e(a){switch(u){case 3===a:return[257,a-3,0];case 4===a:return[258,a-4,0];case 5===a:return[259,a-5,0];case 6===a:return[260,a-6,0];case 7===a:return[261,a-7,0];case 8===a:return[262,a-8,0];case 9===a:return[263,a-9,0];case 10===a:return[264,a-10,0];case 12>=a:return[265,a-11,1];case 14>=a:return[266,a-13,1];case 16>=a:return[267,a-15,1];case 18>=a:return[268,a-17,1];case 22>=a:return[269,a-19,2];case 26>=a:return[270,a-23,2];case 30>=a:return[271,a-27,2];case 34>=a:return[272,
+a-31,2];case 42>=a:return[273,a-35,3];case 50>=a:return[274,a-43,3];case 58>=a:return[275,a-51,3];case 66>=a:return[276,a-59,3];case 82>=a:return[277,a-67,4];case 98>=a:return[278,a-83,4];case 114>=a:return[279,a-99,4];case 130>=a:return[280,a-115,4];case 162>=a:return[281,a-131,5];case 194>=a:return[282,a-163,5];case 226>=a:return[283,a-195,5];case 257>=a:return[284,a-227,5];case 258===a:return[285,a-258,0];default:throw"invalid length: "+a;}}var d=[],c,f;for(c=3;258>=c;c++)f=e(c),d[c]=f[2]<<24|
+f[1]<<16|f[0];return d}(),Ga=C?new Uint32Array(Fa):Fa;
+function na(e,d){function c(a,c){var b=a.g,d=[],f=0,e;e=Ga[a.length];d[f++]=e&65535;d[f++]=e>>16&255;d[f++]=e>>24;var g;switch(u){case 1===b:g=[0,b-1,0];break;case 2===b:g=[1,b-2,0];break;case 3===b:g=[2,b-3,0];break;case 4===b:g=[3,b-4,0];break;case 6>=b:g=[4,b-5,1];break;case 8>=b:g=[5,b-7,1];break;case 12>=b:g=[6,b-9,2];break;case 16>=b:g=[7,b-13,2];break;case 24>=b:g=[8,b-17,3];break;case 32>=b:g=[9,b-25,3];break;case 48>=b:g=[10,b-33,4];break;case 64>=b:g=[11,b-49,4];break;case 96>=b:g=[12,b-
+65,5];break;case 128>=b:g=[13,b-97,5];break;case 192>=b:g=[14,b-129,6];break;case 256>=b:g=[15,b-193,6];break;case 384>=b:g=[16,b-257,7];break;case 512>=b:g=[17,b-385,7];break;case 768>=b:g=[18,b-513,8];break;case 1024>=b:g=[19,b-769,8];break;case 1536>=b:g=[20,b-1025,9];break;case 2048>=b:g=[21,b-1537,9];break;case 3072>=b:g=[22,b-2049,10];break;case 4096>=b:g=[23,b-3073,10];break;case 6144>=b:g=[24,b-4097,11];break;case 8192>=b:g=[25,b-6145,11];break;case 12288>=b:g=[26,b-8193,12];break;case 16384>=
+b:g=[27,b-12289,12];break;case 24576>=b:g=[28,b-16385,13];break;case 32768>=b:g=[29,b-24577,13];break;default:throw"invalid distance";}e=g;d[f++]=e[0];d[f++]=e[1];d[f++]=e[2];var k,m;k=0;for(m=d.length;k<m;++k)l[h++]=d[k];t[d[0]]++;w[d[3]]++;q=a.length+c-1;x=null}var f,a,b,k,m,g={},p,v,x,l=C?new Uint16Array(2*d.length):[],h=0,q=0,t=new (C?Uint32Array:Array)(286),w=new (C?Uint32Array:Array)(30),da=e.f,z;if(!C){for(b=0;285>=b;)t[b++]=0;for(b=0;29>=b;)w[b++]=0}t[256]=1;f=0;for(a=d.length;f<a;++f){b=
+m=0;for(k=3;b<k&&f+b!==a;++b)m=m<<8|d[f+b];g[m]===n&&(g[m]=[]);p=g[m];if(!(0<q--)){for(;0<p.length&&32768<f-p[0];)p.shift();if(f+3>=a){x&&c(x,-1);b=0;for(k=a-f;b<k;++b)z=d[f+b],l[h++]=z,++t[z];break}0<p.length?(v=Ha(d,f,p),x?x.length<v.length?(z=d[f-1],l[h++]=z,++t[z],c(v,0)):c(x,-1):v.length<da?x=v:c(v,0)):x?c(x,-1):(z=d[f],l[h++]=z,++t[z])}p.push(f)}l[h++]=256;t[256]++;e.j=t;e.i=w;return C?l.subarray(0,h):l}
+function Ha(e,d,c){var f,a,b=0,k,m,g,p,v=e.length;m=0;p=c.length;a:for(;m<p;m++){f=c[p-m-1];k=3;if(3<b){for(g=b;3<g;g--)if(e[f+g-1]!==e[d+g-1])continue a;k=b}for(;258>k&&d+k<v&&e[f+k]===e[d+k];)++k;k>b&&(a=f,b=k);if(258===k)break}return new qa(b,d-a)}
+function oa(e,d){var c=e.length,f=new ja(572),a=new (C?Uint8Array:Array)(c),b,k,m,g,p;if(!C)for(g=0;g<c;g++)a[g]=0;for(g=0;g<c;++g)0<e[g]&&f.push(g,e[g]);b=Array(f.length/2);k=new (C?Uint32Array:Array)(f.length/2);if(1===b.length)return a[f.pop().index]=1,a;g=0;for(p=f.length/2;g<p;++g)b[g]=f.pop(),k[g]=b[g].value;m=Ja(k,k.length,d);g=0;for(p=b.length;g<p;++g)a[b[g].index]=m[g];return a}
+function Ja(e,d,c){function f(a){var b=g[a][p[a]];b===d?(f(a+1),f(a+1)):--k[b];++p[a]}var a=new (C?Uint16Array:Array)(c),b=new (C?Uint8Array:Array)(c),k=new (C?Uint8Array:Array)(d),m=Array(c),g=Array(c),p=Array(c),v=(1<<c)-d,x=1<<c-1,l,h,q,t,w;a[c-1]=d;for(h=0;h<c;++h)v<x?b[h]=0:(b[h]=1,v-=x),v<<=1,a[c-2-h]=(a[c-1-h]/2|0)+d;a[0]=b[0];m[0]=Array(a[0]);g[0]=Array(a[0]);for(h=1;h<c;++h)a[h]>2*a[h-1]+b[h]&&(a[h]=2*a[h-1]+b[h]),m[h]=Array(a[h]),g[h]=Array(a[h]);for(l=0;l<d;++l)k[l]=c;for(q=0;q<a[c-1];++q)m[c-
+1][q]=e[q],g[c-1][q]=q;for(l=0;l<c;++l)p[l]=0;1===b[c-1]&&(--k[0],++p[c-1]);for(h=c-2;0<=h;--h){t=l=0;w=p[h+1];for(q=0;q<a[h];q++)t=m[h+1][w]+m[h+1][w+1],t>e[l]?(m[h][q]=t,g[h][q]=d,w+=2):(m[h][q]=e[l],g[h][q]=l,++l);p[h]=0;1===b[h]&&f(h)}return k}
+function pa(e){var d=new (C?Uint16Array:Array)(e.length),c=[],f=[],a=0,b,k,m,g;b=0;for(k=e.length;b<k;b++)c[e[b]]=(c[e[b]]|0)+1;b=1;for(k=16;b<=k;b++)f[b]=a,a+=c[b]|0,a<<=1;b=0;for(k=e.length;b<k;b++){a=f[e[b]];f[e[b]]+=1;m=d[b]=0;for(g=e[b];m<g;m++)d[b]=d[b]<<1|a&1,a>>>=1}return d};ba("Zlib.RawDeflate",ka);ba("Zlib.RawDeflate.prototype.compress",ka.prototype.h);var Ka={NONE:0,FIXED:1,DYNAMIC:ma},V,La,$,Ma;if(Object.keys)V=Object.keys(Ka);else for(La in V=[],$=0,Ka)V[$++]=La;$=0;for(Ma=V.length;$<Ma;++$)La=V[$],ba("Zlib.RawDeflate.CompressionType."+La,Ka[La]);}).call(this); //@ sourceMappingURL=rawdeflate.min.js.map
+
+},{}],99:[function(_dereq_,module,exports){
+/** @license zlib.js 2012 - imaya [ https://github.com/imaya/zlib.js ] The MIT License */(function() {'use strict';var l=this;function p(b,e){var a=b.split("."),c=l;!(a[0]in c)&&c.execScript&&c.execScript("var "+a[0]);for(var d;a.length&&(d=a.shift());)!a.length&&void 0!==e?c[d]=e:c=c[d]?c[d]:c[d]={}};var q="undefined"!==typeof Uint8Array&&"undefined"!==typeof Uint16Array&&"undefined"!==typeof Uint32Array&&"undefined"!==typeof DataView;function t(b){var e=b.length,a=0,c=Number.POSITIVE_INFINITY,d,f,g,h,k,m,r,n,s,J;for(n=0;n<e;++n)b[n]>a&&(a=b[n]),b[n]<c&&(c=b[n]);d=1<<a;f=new (q?Uint32Array:Array)(d);g=1;h=0;for(k=2;g<=a;){for(n=0;n<e;++n)if(b[n]===g){m=0;r=h;for(s=0;s<g;++s)m=m<<1|r&1,r>>=1;J=g<<16|n;for(s=m;s<d;s+=k)f[s]=J;++h}++g;h<<=1;k<<=1}return[f,a,c]};function u(b,e){this.g=[];this.h=32768;this.c=this.f=this.d=this.k=0;this.input=q?new Uint8Array(b):b;this.l=!1;this.i=v;this.q=!1;if(e||!(e={}))e.index&&(this.d=e.index),e.bufferSize&&(this.h=e.bufferSize),e.bufferType&&(this.i=e.bufferType),e.resize&&(this.q=e.resize);switch(this.i){case w:this.a=32768;this.b=new (q?Uint8Array:Array)(32768+this.h+258);break;case v:this.a=0;this.b=new (q?Uint8Array:Array)(this.h);this.e=this.v;this.m=this.s;this.j=this.t;break;default:throw Error("invalid inflate mode");
+}}var w=0,v=1;
+u.prototype.u=function(){for(;!this.l;){var b=x(this,3);b&1&&(this.l=!0);b>>>=1;switch(b){case 0:var e=this.input,a=this.d,c=this.b,d=this.a,f=e.length,g=void 0,h=void 0,k=c.length,m=void 0;this.c=this.f=0;if(a+1>=f)throw Error("invalid uncompressed block header: LEN");g=e[a++]|e[a++]<<8;if(a+1>=f)throw Error("invalid uncompressed block header: NLEN");h=e[a++]|e[a++]<<8;if(g===~h)throw Error("invalid uncompressed block header: length verify");if(a+g>e.length)throw Error("input buffer is broken");switch(this.i){case w:for(;d+
+g>c.length;){m=k-d;g-=m;if(q)c.set(e.subarray(a,a+m),d),d+=m,a+=m;else for(;m--;)c[d++]=e[a++];this.a=d;c=this.e();d=this.a}break;case v:for(;d+g>c.length;)c=this.e({o:2});break;default:throw Error("invalid inflate mode");}if(q)c.set(e.subarray(a,a+g),d),d+=g,a+=g;else for(;g--;)c[d++]=e[a++];this.d=a;this.a=d;this.b=c;break;case 1:this.j(y,z);break;case 2:A(this);break;default:throw Error("unknown BTYPE: "+b);}}return this.m()};
+var B=[16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15],C=q?new Uint16Array(B):B,D=[3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258,258,258],E=q?new Uint16Array(D):D,F=[0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0,0,0],G=q?new Uint8Array(F):F,H=[1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577],I=q?new Uint16Array(H):H,K=[0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,
+13],L=q?new Uint8Array(K):K,M=new (q?Uint8Array:Array)(288),N,O;N=0;for(O=M.length;N<O;++N)M[N]=143>=N?8:255>=N?9:279>=N?7:8;var y=t(M),P=new (q?Uint8Array:Array)(30),Q,R;Q=0;for(R=P.length;Q<R;++Q)P[Q]=5;var z=t(P);function x(b,e){for(var a=b.f,c=b.c,d=b.input,f=b.d,g=d.length,h;c<e;){if(f>=g)throw Error("input buffer is broken");a|=d[f++]<<c;c+=8}h=a&(1<<e)-1;b.f=a>>>e;b.c=c-e;b.d=f;return h}
+function S(b,e){for(var a=b.f,c=b.c,d=b.input,f=b.d,g=d.length,h=e[0],k=e[1],m,r;c<k&&!(f>=g);)a|=d[f++]<<c,c+=8;m=h[a&(1<<k)-1];r=m>>>16;b.f=a>>r;b.c=c-r;b.d=f;return m&65535}
+function A(b){function e(a,b,c){var e,d=this.p,f,g;for(g=0;g<a;)switch(e=S(this,b),e){case 16:for(f=3+x(this,2);f--;)c[g++]=d;break;case 17:for(f=3+x(this,3);f--;)c[g++]=0;d=0;break;case 18:for(f=11+x(this,7);f--;)c[g++]=0;d=0;break;default:d=c[g++]=e}this.p=d;return c}var a=x(b,5)+257,c=x(b,5)+1,d=x(b,4)+4,f=new (q?Uint8Array:Array)(C.length),g,h,k,m;for(m=0;m<d;++m)f[C[m]]=x(b,3);if(!q){m=d;for(d=f.length;m<d;++m)f[C[m]]=0}g=t(f);h=new (q?Uint8Array:Array)(a);k=new (q?Uint8Array:Array)(c);b.p=0;
+b.j(t(e.call(b,a,g,h)),t(e.call(b,c,g,k)))}u.prototype.j=function(b,e){var a=this.b,c=this.a;this.n=b;for(var d=a.length-258,f,g,h,k;256!==(f=S(this,b));)if(256>f)c>=d&&(this.a=c,a=this.e(),c=this.a),a[c++]=f;else{g=f-257;k=E[g];0<G[g]&&(k+=x(this,G[g]));f=S(this,e);h=I[f];0<L[f]&&(h+=x(this,L[f]));c>=d&&(this.a=c,a=this.e(),c=this.a);for(;k--;)a[c]=a[c++-h]}for(;8<=this.c;)this.c-=8,this.d--;this.a=c};
+u.prototype.t=function(b,e){var a=this.b,c=this.a;this.n=b;for(var d=a.length,f,g,h,k;256!==(f=S(this,b));)if(256>f)c>=d&&(a=this.e(),d=a.length),a[c++]=f;else{g=f-257;k=E[g];0<G[g]&&(k+=x(this,G[g]));f=S(this,e);h=I[f];0<L[f]&&(h+=x(this,L[f]));c+k>d&&(a=this.e(),d=a.length);for(;k--;)a[c]=a[c++-h]}for(;8<=this.c;)this.c-=8,this.d--;this.a=c};
+u.prototype.e=function(){var b=new (q?Uint8Array:Array)(this.a-32768),e=this.a-32768,a,c,d=this.b;if(q)b.set(d.subarray(32768,b.length));else{a=0;for(c=b.length;a<c;++a)b[a]=d[a+32768]}this.g.push(b);this.k+=b.length;if(q)d.set(d.subarray(e,e+32768));else for(a=0;32768>a;++a)d[a]=d[e+a];this.a=32768;return d};
+u.prototype.v=function(b){var e,a=this.input.length/this.d+1|0,c,d,f,g=this.input,h=this.b;b&&("number"===typeof b.o&&(a=b.o),"number"===typeof b.r&&(a+=b.r));2>a?(c=(g.length-this.d)/this.n[2],f=258*(c/2)|0,d=f<h.length?h.length+f:h.length<<1):d=h.length*a;q?(e=new Uint8Array(d),e.set(h)):e=h;return this.b=e};
+u.prototype.m=function(){var b=0,e=this.b,a=this.g,c,d=new (q?Uint8Array:Array)(this.k+(this.a-32768)),f,g,h,k;if(0===a.length)return q?this.b.subarray(32768,this.a):this.b.slice(32768,this.a);f=0;for(g=a.length;f<g;++f){c=a[f];h=0;for(k=c.length;h<k;++h)d[b++]=c[h]}f=32768;for(g=this.a;f<g;++f)d[b++]=e[f];this.g=[];return this.buffer=d};
+u.prototype.s=function(){var b,e=this.a;q?this.q?(b=new Uint8Array(e),b.set(this.b.subarray(0,e))):b=this.b.subarray(0,e):(this.b.length>e&&(this.b.length=e),b=this.b);return this.buffer=b};p("Zlib.RawInflate",u);p("Zlib.RawInflate.prototype.decompress",u.prototype.u);var T={ADAPTIVE:v,BLOCK:w},U,V,W,X;if(Object.keys)U=Object.keys(T);else for(V in U=[],W=0,T)U[W++]=V;W=0;for(X=U.length;W<X;++W)V=U[W],p("Zlib.RawInflate.BufferType."+V,T[V]);}).call(this); //@ sourceMappingURL=rawinflate.min.js.map
+
+},{}],100:[function(_dereq_,module,exports){
 exports.Parser = _dereq_("./lib/parser").Parser;
 exports.rules = _dereq_("./lib/rules");
 exports.testing = _dereq_("./lib/testing");
@@ -16770,7 +15418,7 @@ exports.rule = function(ruleBuilder) {
     };
 };
 
-},{"./lib/StringSource":78,"./lib/Token":79,"./lib/bottom-up":81,"./lib/errors":82,"./lib/parser":84,"./lib/parsing-results":85,"./lib/regex-tokeniser":86,"./lib/rules":87,"./lib/testing":88}],78:[function(_dereq_,module,exports){
+},{"./lib/StringSource":101,"./lib/Token":102,"./lib/bottom-up":104,"./lib/errors":105,"./lib/parser":107,"./lib/parsing-results":108,"./lib/regex-tokeniser":109,"./lib/rules":110,"./lib/testing":111}],101:[function(_dereq_,module,exports){
 var util = _dereq_("util");
 
 var StringSource = module.exports = function(string, description) {
@@ -16814,7 +15462,7 @@ StringSourceRange.prototype.describe = function() {
     return util.format("%sLine number: %s\nCharacter number: %s", description, lineNumber, characterNumber);
 };
 
-},{"util":75}],79:[function(_dereq_,module,exports){
+},{"util":80}],102:[function(_dereq_,module,exports){
 module.exports = function(name, value, source) {
     this.name = name;
     this.value = value;
@@ -16823,7 +15471,7 @@ module.exports = function(name, value, source) {
     }
 };
 
-},{}],80:[function(_dereq_,module,exports){
+},{}],103:[function(_dereq_,module,exports){
 var TokenIterator = module.exports = function(tokens, startIndex) {
     this._tokens = tokens;
     this._startIndex = startIndex || 0;
@@ -16853,7 +15501,7 @@ TokenIterator.prototype.to = function(end) {
     return start.to(endToken.source);
 };
 
-},{}],81:[function(_dereq_,module,exports){
+},{}],104:[function(_dereq_,module,exports){
 var rules = _dereq_("./rules");
 var results = _dereq_("./parsing-results");
 
@@ -16983,7 +15631,7 @@ var lazyRule = function(ruleBuilder) {
     };
 };
 
-},{"./parsing-results":85,"./rules":87}],82:[function(_dereq_,module,exports){
+},{"./parsing-results":108,"./rules":110}],105:[function(_dereq_,module,exports){
 exports.error = function(options) {
     return new Error(options);
 };
@@ -16999,7 +15647,7 @@ Error.prototype.describe = function() {
     return locationDescription + "Expected " + this._expected + "\nbut got " + this._actual;
 };
 
-},{}],83:[function(_dereq_,module,exports){
+},{}],106:[function(_dereq_,module,exports){
 var fromArray = exports.fromArray = function(array) {
     var index = 0;
     var hasNext = function() {
@@ -17082,7 +15730,7 @@ LazyIterator.prototype.toArray = function() {
     return result;
 };
 
-},{}],84:[function(_dereq_,module,exports){
+},{}],107:[function(_dereq_,module,exports){
 var TokenIterator = _dereq_("./TokenIterator");
 
 exports.Parser = function(options) {
@@ -17095,7 +15743,7 @@ exports.Parser = function(options) {
     };
 };
 
-},{"./TokenIterator":80}],85:[function(_dereq_,module,exports){
+},{"./TokenIterator":103}],108:[function(_dereq_,module,exports){
 module.exports = {
     failure: function(errors, remaining) {
         if (errors.length < 1) {
@@ -17200,7 +15848,7 @@ Result.prototype.errors = function() {
     return this._errors;
 };
 
-},{}],86:[function(_dereq_,module,exports){
+},{}],109:[function(_dereq_,module,exports){
 var Token = _dereq_("./Token");
 var StringSource = _dereq_("./StringSource");
 
@@ -17265,7 +15913,7 @@ function RegexTokeniser(rules) {
 
 
 
-},{"./StringSource":78,"./Token":79}],87:[function(_dereq_,module,exports){
+},{"./StringSource":101,"./Token":102}],110:[function(_dereq_,module,exports){
 var _ = _dereq_("underscore");
 var options = _dereq_("option");
 var results = _dereq_("./parsing-results");
@@ -17580,7 +16228,7 @@ function describeTokenMismatch(input, expected) {
     return results.failure([error], input);
 }
 
-},{"./errors":82,"./lazy-iterators":83,"./parsing-results":85,"option":89,"underscore":91}],88:[function(_dereq_,module,exports){
+},{"./errors":105,"./lazy-iterators":106,"./parsing-results":108,"option":112,"underscore":114}],111:[function(_dereq_,module,exports){
 var _ = _dereq_("underscore");
 var duck = _dereq_("duck");
 
@@ -17651,7 +16299,7 @@ var assertThat = function(test, value, matcher) {
 };
 
 
-},{"./Token":79,"duck":76,"underscore":91}],89:[function(_dereq_,module,exports){
+},{"./Token":102,"duck":81,"underscore":114}],112:[function(_dereq_,module,exports){
 exports.none = Object.create({
     map: function() {
         return exports.none;
@@ -17699,7 +16347,7 @@ exports.isOption = function(value) {
     return value === exports.none || value instanceof Some;
 };
 
-},{}],90:[function(_dereq_,module,exports){
+},{}],113:[function(_dereq_,module,exports){
 (function (Buffer){
 // wrapper for non-node envs
 ;(function (sax) {
@@ -19058,10 +17706,10 @@ function write (chunk) {
 })(typeof exports === "undefined" ? sax = {} : exports)
 
 }).call(this,_dereq_("buffer").Buffer)
-},{"buffer":60,"stream":67,"string_decoder":73}],91:[function(_dereq_,module,exports){
-//     Underscore.js 1.4.4
+},{"buffer":65,"stream":72,"string_decoder":78}],114:[function(_dereq_,module,exports){
+//     Underscore.js 1.6.0
 //     http://underscorejs.org
-//     (c) 2009-2013 Jeremy Ashkenas, DocumentCloud Inc.
+//     (c) 2009-2014 Jeremy Ashkenas, DocumentCloud and Investigative Reporters & Editors
 //     Underscore may be freely distributed under the MIT license.
 
 (function() {
@@ -19069,7 +17717,7 @@ function write (chunk) {
   // Baseline setup
   // --------------
 
-  // Establish the root object, `window` in the browser, or `global` on the server.
+  // Establish the root object, `window` in the browser, or `exports` on the server.
   var root = this;
 
   // Save the previous value of the `_` variable.
@@ -19082,11 +17730,12 @@ function write (chunk) {
   var ArrayProto = Array.prototype, ObjProto = Object.prototype, FuncProto = Function.prototype;
 
   // Create quick reference variables for speed access to core prototypes.
-  var push             = ArrayProto.push,
-      slice            = ArrayProto.slice,
-      concat           = ArrayProto.concat,
-      toString         = ObjProto.toString,
-      hasOwnProperty   = ObjProto.hasOwnProperty;
+  var
+    push             = ArrayProto.push,
+    slice            = ArrayProto.slice,
+    concat           = ArrayProto.concat,
+    toString         = ObjProto.toString,
+    hasOwnProperty   = ObjProto.hasOwnProperty;
 
   // All **ECMAScript 5** native function implementations that we hope to use
   // are declared here.
@@ -19125,7 +17774,7 @@ function write (chunk) {
   }
 
   // Current version.
-  _.VERSION = '1.4.4';
+  _.VERSION = '1.6.0';
 
   // Collection Functions
   // --------------------
@@ -19134,20 +17783,20 @@ function write (chunk) {
   // Handles objects with the built-in `forEach`, arrays, and raw objects.
   // Delegates to **ECMAScript 5**'s native `forEach` if available.
   var each = _.each = _.forEach = function(obj, iterator, context) {
-    if (obj == null) return;
+    if (obj == null) return obj;
     if (nativeForEach && obj.forEach === nativeForEach) {
       obj.forEach(iterator, context);
     } else if (obj.length === +obj.length) {
-      for (var i = 0, l = obj.length; i < l; i++) {
+      for (var i = 0, length = obj.length; i < length; i++) {
         if (iterator.call(context, obj[i], i, obj) === breaker) return;
       }
     } else {
-      for (var key in obj) {
-        if (_.has(obj, key)) {
-          if (iterator.call(context, obj[key], key, obj) === breaker) return;
-        }
+      var keys = _.keys(obj);
+      for (var i = 0, length = keys.length; i < length; i++) {
+        if (iterator.call(context, obj[keys[i]], keys[i], obj) === breaker) return;
       }
     }
+    return obj;
   };
 
   // Return the results of applying the iterator to each element.
@@ -19157,7 +17806,7 @@ function write (chunk) {
     if (obj == null) return results;
     if (nativeMap && obj.map === nativeMap) return obj.map(iterator, context);
     each(obj, function(value, index, list) {
-      results[results.length] = iterator.call(context, value, index, list);
+      results.push(iterator.call(context, value, index, list));
     });
     return results;
   };
@@ -19213,10 +17862,10 @@ function write (chunk) {
   };
 
   // Return the first value which passes a truth test. Aliased as `detect`.
-  _.find = _.detect = function(obj, iterator, context) {
+  _.find = _.detect = function(obj, predicate, context) {
     var result;
     any(obj, function(value, index, list) {
-      if (iterator.call(context, value, index, list)) {
+      if (predicate.call(context, value, index, list)) {
         result = value;
         return true;
       }
@@ -19227,33 +17876,33 @@ function write (chunk) {
   // Return all the elements that pass a truth test.
   // Delegates to **ECMAScript 5**'s native `filter` if available.
   // Aliased as `select`.
-  _.filter = _.select = function(obj, iterator, context) {
+  _.filter = _.select = function(obj, predicate, context) {
     var results = [];
     if (obj == null) return results;
-    if (nativeFilter && obj.filter === nativeFilter) return obj.filter(iterator, context);
+    if (nativeFilter && obj.filter === nativeFilter) return obj.filter(predicate, context);
     each(obj, function(value, index, list) {
-      if (iterator.call(context, value, index, list)) results[results.length] = value;
+      if (predicate.call(context, value, index, list)) results.push(value);
     });
     return results;
   };
 
   // Return all the elements for which a truth test fails.
-  _.reject = function(obj, iterator, context) {
+  _.reject = function(obj, predicate, context) {
     return _.filter(obj, function(value, index, list) {
-      return !iterator.call(context, value, index, list);
+      return !predicate.call(context, value, index, list);
     }, context);
   };
 
   // Determine whether all of the elements match a truth test.
   // Delegates to **ECMAScript 5**'s native `every` if available.
   // Aliased as `all`.
-  _.every = _.all = function(obj, iterator, context) {
-    iterator || (iterator = _.identity);
+  _.every = _.all = function(obj, predicate, context) {
+    predicate || (predicate = _.identity);
     var result = true;
     if (obj == null) return result;
-    if (nativeEvery && obj.every === nativeEvery) return obj.every(iterator, context);
+    if (nativeEvery && obj.every === nativeEvery) return obj.every(predicate, context);
     each(obj, function(value, index, list) {
-      if (!(result = result && iterator.call(context, value, index, list))) return breaker;
+      if (!(result = result && predicate.call(context, value, index, list))) return breaker;
     });
     return !!result;
   };
@@ -19261,13 +17910,13 @@ function write (chunk) {
   // Determine if at least one element in the object matches a truth test.
   // Delegates to **ECMAScript 5**'s native `some` if available.
   // Aliased as `any`.
-  var any = _.some = _.any = function(obj, iterator, context) {
-    iterator || (iterator = _.identity);
+  var any = _.some = _.any = function(obj, predicate, context) {
+    predicate || (predicate = _.identity);
     var result = false;
     if (obj == null) return result;
-    if (nativeSome && obj.some === nativeSome) return obj.some(iterator, context);
+    if (nativeSome && obj.some === nativeSome) return obj.some(predicate, context);
     each(obj, function(value, index, list) {
-      if (result || (result = iterator.call(context, value, index, list))) return breaker;
+      if (result || (result = predicate.call(context, value, index, list))) return breaker;
     });
     return !!result;
   };
@@ -19293,41 +17942,37 @@ function write (chunk) {
 
   // Convenience version of a common use case of `map`: fetching a property.
   _.pluck = function(obj, key) {
-    return _.map(obj, function(value){ return value[key]; });
+    return _.map(obj, _.property(key));
   };
 
   // Convenience version of a common use case of `filter`: selecting only objects
   // containing specific `key:value` pairs.
-  _.where = function(obj, attrs, first) {
-    if (_.isEmpty(attrs)) return first ? null : [];
-    return _[first ? 'find' : 'filter'](obj, function(value) {
-      for (var key in attrs) {
-        if (attrs[key] !== value[key]) return false;
-      }
-      return true;
-    });
+  _.where = function(obj, attrs) {
+    return _.filter(obj, _.matches(attrs));
   };
 
   // Convenience version of a common use case of `find`: getting the first object
   // containing specific `key:value` pairs.
   _.findWhere = function(obj, attrs) {
-    return _.where(obj, attrs, true);
+    return _.find(obj, _.matches(attrs));
   };
 
   // Return the maximum element or (element-based computation).
   // Can't optimize arrays of integers longer than 65,535 elements.
-  // See: https://bugs.webkit.org/show_bug.cgi?id=80797
+  // See [WebKit Bug 80797](https://bugs.webkit.org/show_bug.cgi?id=80797)
   _.max = function(obj, iterator, context) {
     if (!iterator && _.isArray(obj) && obj[0] === +obj[0] && obj.length < 65535) {
       return Math.max.apply(Math, obj);
     }
-    if (!iterator && _.isEmpty(obj)) return -Infinity;
-    var result = {computed : -Infinity, value: -Infinity};
+    var result = -Infinity, lastComputed = -Infinity;
     each(obj, function(value, index, list) {
       var computed = iterator ? iterator.call(context, value, index, list) : value;
-      computed >= result.computed && (result = {value : value, computed : computed});
+      if (computed > lastComputed) {
+        result = value;
+        lastComputed = computed;
+      }
     });
-    return result.value;
+    return result;
   };
 
   // Return the minimum element (or element-based computation).
@@ -19335,16 +17980,19 @@ function write (chunk) {
     if (!iterator && _.isArray(obj) && obj[0] === +obj[0] && obj.length < 65535) {
       return Math.min.apply(Math, obj);
     }
-    if (!iterator && _.isEmpty(obj)) return Infinity;
-    var result = {computed : Infinity, value: Infinity};
+    var result = Infinity, lastComputed = Infinity;
     each(obj, function(value, index, list) {
       var computed = iterator ? iterator.call(context, value, index, list) : value;
-      computed < result.computed && (result = {value : value, computed : computed});
+      if (computed < lastComputed) {
+        result = value;
+        lastComputed = computed;
+      }
     });
-    return result.value;
+    return result;
   };
 
-  // Shuffle an array.
+  // Shuffle an array, using the modern version of the
+  // [Fisher-Yates shuffle](http://en.wikipedia.org/wiki/Fisher–Yates_shuffle).
   _.shuffle = function(obj) {
     var rand;
     var index = 0;
@@ -19357,19 +18005,32 @@ function write (chunk) {
     return shuffled;
   };
 
+  // Sample **n** random values from a collection.
+  // If **n** is not specified, returns a single random element.
+  // The internal `guard` argument allows it to work with `map`.
+  _.sample = function(obj, n, guard) {
+    if (n == null || guard) {
+      if (obj.length !== +obj.length) obj = _.values(obj);
+      return obj[_.random(obj.length - 1)];
+    }
+    return _.shuffle(obj).slice(0, Math.max(0, n));
+  };
+
   // An internal function to generate lookup iterators.
   var lookupIterator = function(value) {
-    return _.isFunction(value) ? value : function(obj){ return obj[value]; };
+    if (value == null) return _.identity;
+    if (_.isFunction(value)) return value;
+    return _.property(value);
   };
 
   // Sort the object's values by a criterion produced by an iterator.
-  _.sortBy = function(obj, value, context) {
-    var iterator = lookupIterator(value);
+  _.sortBy = function(obj, iterator, context) {
+    iterator = lookupIterator(iterator);
     return _.pluck(_.map(obj, function(value, index, list) {
       return {
-        value : value,
-        index : index,
-        criteria : iterator.call(context, value, index, list)
+        value: value,
+        index: index,
+        criteria: iterator.call(context, value, index, list)
       };
     }).sort(function(left, right) {
       var a = left.criteria;
@@ -19378,43 +18039,46 @@ function write (chunk) {
         if (a > b || a === void 0) return 1;
         if (a < b || b === void 0) return -1;
       }
-      return left.index < right.index ? -1 : 1;
+      return left.index - right.index;
     }), 'value');
   };
 
   // An internal function used for aggregate "group by" operations.
-  var group = function(obj, value, context, behavior) {
-    var result = {};
-    var iterator = lookupIterator(value || _.identity);
-    each(obj, function(value, index) {
-      var key = iterator.call(context, value, index, obj);
-      behavior(result, key, value);
-    });
-    return result;
+  var group = function(behavior) {
+    return function(obj, iterator, context) {
+      var result = {};
+      iterator = lookupIterator(iterator);
+      each(obj, function(value, index) {
+        var key = iterator.call(context, value, index, obj);
+        behavior(result, key, value);
+      });
+      return result;
+    };
   };
 
   // Groups the object's values by a criterion. Pass either a string attribute
   // to group by, or a function that returns the criterion.
-  _.groupBy = function(obj, value, context) {
-    return group(obj, value, context, function(result, key, value) {
-      (_.has(result, key) ? result[key] : (result[key] = [])).push(value);
-    });
-  };
+  _.groupBy = group(function(result, key, value) {
+    _.has(result, key) ? result[key].push(value) : result[key] = [value];
+  });
+
+  // Indexes the object's values by a criterion, similar to `groupBy`, but for
+  // when you know that your index values will be unique.
+  _.indexBy = group(function(result, key, value) {
+    result[key] = value;
+  });
 
   // Counts instances of an object that group by a certain criterion. Pass
   // either a string attribute to count by, or a function that returns the
   // criterion.
-  _.countBy = function(obj, value, context) {
-    return group(obj, value, context, function(result, key) {
-      if (!_.has(result, key)) result[key] = 0;
-      result[key]++;
-    });
-  };
+  _.countBy = group(function(result, key) {
+    _.has(result, key) ? result[key]++ : result[key] = 1;
+  });
 
   // Use a comparator function to figure out the smallest index at which
   // an object should be inserted so as to maintain order. Uses binary search.
   _.sortedIndex = function(array, obj, iterator, context) {
-    iterator = iterator == null ? _.identity : lookupIterator(iterator);
+    iterator = lookupIterator(iterator);
     var value = iterator.call(context, obj);
     var low = 0, high = array.length;
     while (low < high) {
@@ -19424,7 +18088,7 @@ function write (chunk) {
     return low;
   };
 
-  // Safely convert anything iterable into a real, live array.
+  // Safely create a real, live array from anything iterable.
   _.toArray = function(obj) {
     if (!obj) return [];
     if (_.isArray(obj)) return slice.call(obj);
@@ -19446,7 +18110,9 @@ function write (chunk) {
   // allows it to work with `_.map`.
   _.first = _.head = _.take = function(array, n, guard) {
     if (array == null) return void 0;
-    return (n != null) && !guard ? slice.call(array, 0, n) : array[0];
+    if ((n == null) || guard) return array[0];
+    if (n < 0) return [];
+    return slice.call(array, 0, n);
   };
 
   // Returns everything but the last entry of the array. Especially useful on
@@ -19461,11 +18127,8 @@ function write (chunk) {
   // values in the array. The **guard** check allows it to work with `_.map`.
   _.last = function(array, n, guard) {
     if (array == null) return void 0;
-    if ((n != null) && !guard) {
-      return slice.call(array, Math.max(array.length - n, 0));
-    } else {
-      return array[array.length - 1];
-    }
+    if ((n == null) || guard) return array[array.length - 1];
+    return slice.call(array, Math.max(array.length - n, 0));
   };
 
   // Returns everything but the first entry of the array. Aliased as `tail` and `drop`.
@@ -19483,8 +18146,11 @@ function write (chunk) {
 
   // Internal implementation of a recursive `flatten` function.
   var flatten = function(input, shallow, output) {
+    if (shallow && _.every(input, _.isArray)) {
+      return concat.apply(output, input);
+    }
     each(input, function(value) {
-      if (_.isArray(value)) {
+      if (_.isArray(value) || _.isArguments(value)) {
         shallow ? push.apply(output, value) : flatten(value, shallow, output);
       } else {
         output.push(value);
@@ -19493,7 +18159,7 @@ function write (chunk) {
     return output;
   };
 
-  // Return a completely flattened version of an array.
+  // Flatten out an array, either recursively (by default), or just one level.
   _.flatten = function(array, shallow) {
     return flatten(array, shallow, []);
   };
@@ -19501,6 +18167,16 @@ function write (chunk) {
   // Return a version of the array that does not contain the specified value(s).
   _.without = function(array) {
     return _.difference(array, slice.call(arguments, 1));
+  };
+
+  // Split an array into two arrays: one whose elements all satisfy the given
+  // predicate, and one whose elements all do not satisfy the predicate.
+  _.partition = function(array, predicate) {
+    var pass = [], fail = [];
+    each(array, function(elem) {
+      (predicate(elem) ? pass : fail).push(elem);
+    });
+    return [pass, fail];
   };
 
   // Produce a duplicate-free version of the array. If the array has already
@@ -19527,7 +18203,7 @@ function write (chunk) {
   // Produce an array that contains the union: each distinct element from all of
   // the passed-in arrays.
   _.union = function() {
-    return _.uniq(concat.apply(ArrayProto, arguments));
+    return _.uniq(_.flatten(arguments, true));
   };
 
   // Produce an array that contains every item shared between all the
@@ -19536,7 +18212,7 @@ function write (chunk) {
     var rest = slice.call(arguments, 1);
     return _.filter(_.uniq(array), function(item) {
       return _.every(rest, function(other) {
-        return _.indexOf(other, item) >= 0;
+        return _.contains(other, item);
       });
     });
   };
@@ -19551,11 +18227,10 @@ function write (chunk) {
   // Zip together multiple lists into a single array -- elements that share
   // an index go together.
   _.zip = function() {
-    var args = slice.call(arguments);
-    var length = _.max(_.pluck(args, 'length'));
+    var length = _.max(_.pluck(arguments, 'length').concat(0));
     var results = new Array(length);
     for (var i = 0; i < length; i++) {
-      results[i] = _.pluck(args, "" + i);
+      results[i] = _.pluck(arguments, '' + i);
     }
     return results;
   };
@@ -19566,7 +18241,7 @@ function write (chunk) {
   _.object = function(list, values) {
     if (list == null) return {};
     var result = {};
-    for (var i = 0, l = list.length; i < l; i++) {
+    for (var i = 0, length = list.length; i < length; i++) {
       if (values) {
         result[list[i]] = values[i];
       } else {
@@ -19584,17 +18259,17 @@ function write (chunk) {
   // for **isSorted** to use binary search.
   _.indexOf = function(array, item, isSorted) {
     if (array == null) return -1;
-    var i = 0, l = array.length;
+    var i = 0, length = array.length;
     if (isSorted) {
       if (typeof isSorted == 'number') {
-        i = (isSorted < 0 ? Math.max(0, l + isSorted) : isSorted);
+        i = (isSorted < 0 ? Math.max(0, length + isSorted) : isSorted);
       } else {
         i = _.sortedIndex(array, item);
         return array[i] === item ? i : -1;
       }
     }
     if (nativeIndexOf && array.indexOf === nativeIndexOf) return array.indexOf(item, isSorted);
-    for (; i < l; i++) if (array[i] === item) return i;
+    for (; i < length; i++) if (array[i] === item) return i;
     return -1;
   };
 
@@ -19620,11 +18295,11 @@ function write (chunk) {
     }
     step = arguments[2] || 1;
 
-    var len = Math.max(Math.ceil((stop - start) / step), 0);
+    var length = Math.max(Math.ceil((stop - start) / step), 0);
     var idx = 0;
-    var range = new Array(len);
+    var range = new Array(length);
 
-    while(idx < len) {
+    while(idx < length) {
       range[idx++] = start;
       start += step;
     }
@@ -19635,31 +18310,50 @@ function write (chunk) {
   // Function (ahem) Functions
   // ------------------
 
+  // Reusable constructor function for prototype setting.
+  var ctor = function(){};
+
   // Create a function bound to a given object (assigning `this`, and arguments,
   // optionally). Delegates to **ECMAScript 5**'s native `Function.bind` if
   // available.
   _.bind = function(func, context) {
-    if (func.bind === nativeBind && nativeBind) return nativeBind.apply(func, slice.call(arguments, 1));
-    var args = slice.call(arguments, 2);
-    return function() {
-      return func.apply(context, args.concat(slice.call(arguments)));
+    var args, bound;
+    if (nativeBind && func.bind === nativeBind) return nativeBind.apply(func, slice.call(arguments, 1));
+    if (!_.isFunction(func)) throw new TypeError;
+    args = slice.call(arguments, 2);
+    return bound = function() {
+      if (!(this instanceof bound)) return func.apply(context, args.concat(slice.call(arguments)));
+      ctor.prototype = func.prototype;
+      var self = new ctor;
+      ctor.prototype = null;
+      var result = func.apply(self, args.concat(slice.call(arguments)));
+      if (Object(result) === result) return result;
+      return self;
     };
   };
 
   // Partially apply a function by creating a version that has had some of its
-  // arguments pre-filled, without changing its dynamic `this` context.
+  // arguments pre-filled, without changing its dynamic `this` context. _ acts
+  // as a placeholder, allowing any combination of arguments to be pre-filled.
   _.partial = function(func) {
-    var args = slice.call(arguments, 1);
+    var boundArgs = slice.call(arguments, 1);
     return function() {
-      return func.apply(this, args.concat(slice.call(arguments)));
+      var position = 0;
+      var args = boundArgs.slice();
+      for (var i = 0, length = args.length; i < length; i++) {
+        if (args[i] === _) args[i] = arguments[position++];
+      }
+      while (position < arguments.length) args.push(arguments[position++]);
+      return func.apply(this, args);
     };
   };
 
-  // Bind all of an object's methods to that object. Useful for ensuring that
-  // all callbacks defined on an object belong to it.
+  // Bind a number of an object's methods to that object. Remaining arguments
+  // are the method names to be bound. Useful for ensuring that all callbacks
+  // defined on an object belong to it.
   _.bindAll = function(obj) {
     var funcs = slice.call(arguments, 1);
-    if (funcs.length === 0) funcs = _.functions(obj);
+    if (funcs.length === 0) throw new Error('bindAll must be passed function names');
     each(funcs, function(f) { obj[f] = _.bind(obj[f], obj); });
     return obj;
   };
@@ -19688,17 +18382,24 @@ function write (chunk) {
   };
 
   // Returns a function, that, when invoked, will only be triggered at most once
-  // during a given window of time.
-  _.throttle = function(func, wait) {
-    var context, args, timeout, result;
+  // during a given window of time. Normally, the throttled function will run
+  // as much as it can, without ever going more than once per `wait` duration;
+  // but if you'd like to disable the execution on the leading edge, pass
+  // `{leading: false}`. To disable execution on the trailing edge, ditto.
+  _.throttle = function(func, wait, options) {
+    var context, args, result;
+    var timeout = null;
     var previous = 0;
+    options || (options = {});
     var later = function() {
-      previous = new Date;
+      previous = options.leading === false ? 0 : _.now();
       timeout = null;
       result = func.apply(context, args);
+      context = args = null;
     };
     return function() {
-      var now = new Date;
+      var now = _.now();
+      if (!previous && options.leading === false) previous = now;
       var remaining = wait - (now - previous);
       context = this;
       args = arguments;
@@ -19707,7 +18408,8 @@ function write (chunk) {
         timeout = null;
         previous = now;
         result = func.apply(context, args);
-      } else if (!timeout) {
+        context = args = null;
+      } else if (!timeout && options.trailing !== false) {
         timeout = setTimeout(later, remaining);
       }
       return result;
@@ -19719,17 +18421,34 @@ function write (chunk) {
   // N milliseconds. If `immediate` is passed, trigger the function on the
   // leading edge, instead of the trailing.
   _.debounce = function(func, wait, immediate) {
-    var timeout, result;
-    return function() {
-      var context = this, args = arguments;
-      var later = function() {
+    var timeout, args, context, timestamp, result;
+
+    var later = function() {
+      var last = _.now() - timestamp;
+      if (last < wait) {
+        timeout = setTimeout(later, wait - last);
+      } else {
         timeout = null;
-        if (!immediate) result = func.apply(context, args);
-      };
+        if (!immediate) {
+          result = func.apply(context, args);
+          context = args = null;
+        }
+      }
+    };
+
+    return function() {
+      context = this;
+      args = arguments;
+      timestamp = _.now();
       var callNow = immediate && !timeout;
-      clearTimeout(timeout);
-      timeout = setTimeout(later, wait);
-      if (callNow) result = func.apply(context, args);
+      if (!timeout) {
+        timeout = setTimeout(later, wait);
+      }
+      if (callNow) {
+        result = func.apply(context, args);
+        context = args = null;
+      }
+
       return result;
     };
   };
@@ -19751,11 +18470,7 @@ function write (chunk) {
   // allowing you to adjust arguments, run code before and after, and
   // conditionally execute the original function.
   _.wrap = function(func, wrapper) {
-    return function() {
-      var args = [func];
-      push.apply(args, arguments);
-      return wrapper.apply(this, args);
-    };
+    return _.partial(wrapper, func);
   };
 
   // Returns a function that is the composition of a list of functions, each
@@ -19773,7 +18488,6 @@ function write (chunk) {
 
   // Returns a function that will only be executed after being called N times.
   _.after = function(times, func) {
-    if (times <= 0) return func();
     return function() {
       if (--times < 1) {
         return func.apply(this, arguments);
@@ -19786,31 +18500,43 @@ function write (chunk) {
 
   // Retrieve the names of an object's properties.
   // Delegates to **ECMAScript 5**'s native `Object.keys`
-  _.keys = nativeKeys || function(obj) {
-    if (obj !== Object(obj)) throw new TypeError('Invalid object');
+  _.keys = function(obj) {
+    if (!_.isObject(obj)) return [];
+    if (nativeKeys) return nativeKeys(obj);
     var keys = [];
-    for (var key in obj) if (_.has(obj, key)) keys[keys.length] = key;
+    for (var key in obj) if (_.has(obj, key)) keys.push(key);
     return keys;
   };
 
   // Retrieve the values of an object's properties.
   _.values = function(obj) {
-    var values = [];
-    for (var key in obj) if (_.has(obj, key)) values.push(obj[key]);
+    var keys = _.keys(obj);
+    var length = keys.length;
+    var values = new Array(length);
+    for (var i = 0; i < length; i++) {
+      values[i] = obj[keys[i]];
+    }
     return values;
   };
 
   // Convert an object into a list of `[key, value]` pairs.
   _.pairs = function(obj) {
-    var pairs = [];
-    for (var key in obj) if (_.has(obj, key)) pairs.push([key, obj[key]]);
+    var keys = _.keys(obj);
+    var length = keys.length;
+    var pairs = new Array(length);
+    for (var i = 0; i < length; i++) {
+      pairs[i] = [keys[i], obj[keys[i]]];
+    }
     return pairs;
   };
 
   // Invert the keys and values of an object. The values must be serializable.
   _.invert = function(obj) {
     var result = {};
-    for (var key in obj) if (_.has(obj, key)) result[obj[key]] = key;
+    var keys = _.keys(obj);
+    for (var i = 0, length = keys.length; i < length; i++) {
+      result[obj[keys[i]]] = keys[i];
+    }
     return result;
   };
 
@@ -19861,7 +18587,7 @@ function write (chunk) {
     each(slice.call(arguments, 1), function(source) {
       if (source) {
         for (var prop in source) {
-          if (obj[prop] == null) obj[prop] = source[prop];
+          if (obj[prop] === void 0) obj[prop] = source[prop];
         }
       }
     });
@@ -19885,7 +18611,7 @@ function write (chunk) {
   // Internal recursive comparison function for `isEqual`.
   var eq = function(a, b, aStack, bStack) {
     // Identical objects are equal. `0 === -0`, but they aren't identical.
-    // See the Harmony `egal` proposal: http://wiki.ecmascript.org/doku.php?id=harmony:egal.
+    // See the [Harmony `egal` proposal](http://wiki.ecmascript.org/doku.php?id=harmony:egal).
     if (a === b) return a !== 0 || 1 / a == 1 / b;
     // A strict comparison is necessary because `null == undefined`.
     if (a == null || b == null) return a === b;
@@ -19927,6 +18653,14 @@ function write (chunk) {
       // unique nested structures.
       if (aStack[length] == a) return bStack[length] == b;
     }
+    // Objects with different constructors are not equivalent, but `Object`s
+    // from different frames are.
+    var aCtor = a.constructor, bCtor = b.constructor;
+    if (aCtor !== bCtor && !(_.isFunction(aCtor) && (aCtor instanceof aCtor) &&
+                             _.isFunction(bCtor) && (bCtor instanceof bCtor))
+                        && ('constructor' in a && 'constructor' in b)) {
+      return false;
+    }
     // Add the first object to the stack of traversed objects.
     aStack.push(a);
     bStack.push(b);
@@ -19943,13 +18677,6 @@ function write (chunk) {
         }
       }
     } else {
-      // Objects with different constructors are not equivalent, but `Object`s
-      // from different frames are.
-      var aCtor = a.constructor, bCtor = b.constructor;
-      if (aCtor !== bCtor && !(_.isFunction(aCtor) && (aCtor instanceof aCtor) &&
-                               _.isFunction(bCtor) && (bCtor instanceof bCtor))) {
-        return false;
-      }
       // Deep compare objects.
       for (var key in a) {
         if (_.has(a, key)) {
@@ -20071,9 +18798,33 @@ function write (chunk) {
     return value;
   };
 
+  _.constant = function(value) {
+    return function () {
+      return value;
+    };
+  };
+
+  _.property = function(key) {
+    return function(obj) {
+      return obj[key];
+    };
+  };
+
+  // Returns a predicate for checking whether an object has a given set of `key:value` pairs.
+  _.matches = function(attrs) {
+    return function(obj) {
+      if (obj === attrs) return true; //avoid comparing an object to itself.
+      for (var key in attrs) {
+        if (attrs[key] !== obj[key])
+          return false;
+      }
+      return true;
+    }
+  };
+
   // Run a function **n** times.
   _.times = function(n, iterator, context) {
-    var accum = Array(n);
+    var accum = Array(Math.max(0, n));
     for (var i = 0; i < n; i++) accum[i] = iterator.call(context, i);
     return accum;
   };
@@ -20087,6 +18838,9 @@ function write (chunk) {
     return min + Math.floor(Math.random() * (max - min + 1));
   };
 
+  // A (possibly faster) way to get the current timestamp as an integer.
+  _.now = Date.now || function() { return new Date().getTime(); };
+
   // List of HTML entities for escaping.
   var entityMap = {
     escape: {
@@ -20094,8 +18848,7 @@ function write (chunk) {
       '<': '&lt;',
       '>': '&gt;',
       '"': '&quot;',
-      "'": '&#x27;',
-      '/': '&#x2F;'
+      "'": '&#x27;'
     }
   };
   entityMap.unescape = _.invert(entityMap.escape);
@@ -20116,17 +18869,17 @@ function write (chunk) {
     };
   });
 
-  // If the value of the named property is a function then invoke it;
-  // otherwise, return it.
+  // If the value of the named `property` is a function then invoke it with the
+  // `object` as context; otherwise, return it.
   _.result = function(object, property) {
-    if (object == null) return null;
+    if (object == null) return void 0;
     var value = object[property];
     return _.isFunction(value) ? value.call(object) : value;
   };
 
   // Add your own custom functions to the Underscore object.
   _.mixin = function(obj) {
-    each(_.functions(obj), function(name){
+    each(_.functions(obj), function(name) {
       var func = _[name] = obj[name];
       _.prototype[name] = function() {
         var args = [this._wrapped];
@@ -20284,8 +19037,20 @@ function write (chunk) {
 
   });
 
+  // AMD registration happens at the end for compatibility with AMD loaders
+  // that may not enforce next-turn semantics on modules. Even though general
+  // practice for AMD registration is to be anonymous, underscore registers
+  // as a named module because, like jQuery, it is a base library that is
+  // popular enough to be bundled in a third party lib, but not be part of
+  // an AMD load request. Those cases could generate an error when an
+  // anonymous define() is called outside of a loader request.
+  if (typeof define === 'function' && define.amd) {
+    define('underscore', [], function() {
+      return _;
+    });
+  }
 }).call(this);
 
-},{}]},{},[13])
-(13)
+},{}]},{},[16])
+(16)
 });
