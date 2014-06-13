@@ -34,3 +34,9 @@ h1 a {
 .demo #output img {
     max-width: 100%;
 }
+
+.moved {
+    margin: 1em 0;
+    padding: 1em;
+    background-color: #cfc;
+}
